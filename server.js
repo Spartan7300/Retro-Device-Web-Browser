@@ -30,9 +30,9 @@ app.get("/proxy-css", async (req, res) => {
 
     // Rewrite relative URLs in CSS
     css = css.replace(/url\(([^)]+)\)/g, (match, path) => {
-      path = path.replace(/['"]/g, "");
+      path = path.replace(/['"]/g, "").trim();
       const absolute = resolveUrl(cssUrl, path);
-      return `url(${proxify(absolute)})`;
+      return absolute ? `url(${proxify(absolute)})` : match;
     });
 
     res.set("Content-Type", "text/css");
@@ -95,7 +95,7 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // Remove external scripts
+    // Remove only external scripts to save memory, keep inline scripts
     $("script[src]").remove();
 
     // Rewrite CSS links through /proxy-css
@@ -135,14 +135,14 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(form).attr("action", proxify(absolute));
     });
 
-    // Convert buttons with location.href / window.location to links
+    // Convert buttons with location.href / window.location JS into clickable links
     $("[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
       if (match) {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) {
-          // Keep the original element in UI
+          // Keep button in UI, wrap in <a> so it’s clickable
           const elHtml = $.html(el);
           $(el).replaceWith(`<a href="${proxify(absolute)}" style="display:inline-block">${elHtml}</a>`);
         }
