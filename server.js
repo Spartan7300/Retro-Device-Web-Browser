@@ -8,10 +8,12 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: true }));
 
+// Helper: convert any URL to go through the proxy
 function proxify(url) {
   return "/proxy?url=" + encodeURIComponent(url);
 }
 
+// Helper: resolve relative URLs against base
 function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -20,7 +22,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// Asset proxy
+// --- Asset proxy ---
 app.get("/asset", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("No URL");
@@ -35,7 +37,7 @@ app.get("/asset", async (req, res) => {
   }
 });
 
-// Main proxy
+// --- Main proxy ---
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
   if (!target) return res.send("No URL provided");
@@ -68,6 +70,7 @@ app.all("/proxy", async (req, res) => {
     const response = await fetch(urlObj.toString(), fetchOptions);
     const contentType = response.headers.get("content-type") || "";
 
+    // Non-HTML assets are streamed directly
     if (!contentType.includes("text/html")) {
       res.set("Content-Type", contentType);
       return response.body.pipe(res);
@@ -77,7 +80,7 @@ app.all("/proxy", async (req, res) => {
     const $ = cheerio.load(html);
     const base = urlObj.toString();
 
-    // Rewrite all links/forms through proxy
+    // --- Rewrite all links ---
     $("a").each((i, el) => {
       const href = $(el).attr("href");
       if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
@@ -85,13 +88,14 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", proxify(absolute));
     });
 
+    // --- Rewrite all forms ---
     $("form").each((i, el) => {
       const action = resolveUrl(base, $(el).attr("action") || base) || base;
       $(el).attr("action", proxify(action));
       $(el).attr("method", ($(el).attr("method") || "GET").toUpperCase());
     });
 
-    // Proxy assets
+    // --- Proxy assets ---
     $("img, iframe, script").each((i, el) => {
       const src = $(el).attr("src");
       if (!src || src.startsWith("data:")) return;
@@ -105,7 +109,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", "/asset?url=" + encodeURIComponent(absolute));
     });
 
-    // Transform buttons
+    // --- Transform buttons with onclick location ---
     $("button[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
@@ -119,13 +123,13 @@ app.all("/proxy", async (req, res) => {
     });
 
     // --- TRANSPILE MODULES TO ES5 ---
-    $("script[type='module']").each((i, el) => {
+    const moduleScripts = $("script[type='module']").toArray();
+    for (const el of moduleScripts) {
       const src = $(el).attr("src");
       if (src) {
         const absolute = resolveUrl(base, src);
         if (absolute) {
           try {
-            // Fetch JS and transpile
             const jsRes = await fetch(absolute);
             const jsText = await jsRes.text();
             const result = await esbuild.transform(jsText, { target: "es5", loader: "js" });
@@ -137,9 +141,9 @@ app.all("/proxy", async (req, res) => {
           }
         }
       }
-    });
+    }
 
-    // Optional: inject polyfills for fetch, Promise, WebSocket here
+    // --- Optional: polyfills for fetch, Promise, WebSocket can be injected here ---
 
     res.send($.html());
   } catch (err) {
