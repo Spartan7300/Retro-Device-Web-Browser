@@ -8,12 +8,18 @@ const PORT = process.env.PORT || 3000;
 app.get("/proxy", async (req, res) => {
     let target = req.query.url;
 
-    // --- Special handling for Wikipedia search forms ---
+    // --- Wikipedia special handling ---
     if (!target && req.query.family === "wikipedia") {
         const search = req.query.search || "";
         const language = req.query.language || "en";
         const go = req.query.go || "";
         target = `https://${language}.wikipedia.org/w/index.php?search=${encodeURIComponent(search)}&go=${encodeURIComponent(go)}`;
+    }
+
+    // --- Google search handling (NEW) ---
+    if (!target && req.query.q) {
+        const query = encodeURIComponent(req.query.q);
+        target = `https://www.google.com/search?q=${query}`;
     }
 
     if (!target) {
@@ -27,55 +33,90 @@ app.get("/proxy", async (req, res) => {
     try {
         const urlObj = new URL(target);
 
-        // --- Forward all query parameters except 'url' and Wikipedia special keys ---
+        // --- Forward query params (excluding special ones) ---
         Object.keys(req.query).forEach(key => {
-            if (key !== "url" && key !== "family" && key !== "search" && key !== "language" && key !== "go") {
+            if (!["url", "family", "search", "language", "go", "q"].includes(key)) {
                 urlObj.searchParams.set(key, req.query[key]);
             }
         });
 
-        const response = await fetch(urlObj.toString());
+        const response = await fetch(urlObj.toString(), {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (compatible; OldBrowserProxy/1.0)"
+            }
+        });
+
         let html = await response.text();
 
         const dom = new JSDOM(html);
         const document = dom.window.document;
 
-        // --- Remove external scripts but keep inline JS ---
+        // --- Remove external scripts ---
         document.querySelectorAll("script").forEach(script => {
             if (script.src) script.remove();
         });
 
-        // --- Rewrite all links ---
+        // --- Rewrite links ---
         document.querySelectorAll("a").forEach(link => {
             const href = link.getAttribute("href");
             if (href && !href.startsWith("javascript")) {
-                link.setAttribute(
-                    "href",
-                    `/proxy?url=${encodeURIComponent(new URL(href, urlObj))}`
-                );
+                try {
+                    const absolute = new URL(href, urlObj);
+                    link.setAttribute(
+                        "href",
+                        `/proxy?url=${encodeURIComponent(absolute)}`
+                    );
+                } catch {}
             }
         });
 
-        // --- Rewrite all forms to go through proxy ---
+        // --- Rewrite forms ---
         document.querySelectorAll("form").forEach(form => {
             let action = form.getAttribute("action") || "";
+
             if (!action.startsWith("javascript")) {
-                const absolute = new URL(action, urlObj);
-                form.setAttribute("method", "GET"); // force GET for old devices
-                form.setAttribute(
-                    "action",
-                    "/proxy?url=" + encodeURIComponent(absolute)
-                );
+                try {
+                    const absolute = new URL(action, urlObj);
+
+                    // Detect Google search form
+                    const searchInput = form.querySelector("input[name='q']");
+
+                    if (absolute.hostname.includes("google.com") && searchInput) {
+                        // Force simple GET-based search
+                        form.setAttribute("method", "GET");
+                        form.setAttribute("action", "/proxy");
+
+                        // Remove all other inputs except 'q'
+                        form.querySelectorAll("input").forEach(input => {
+                            if (input.name !== "q") input.remove();
+                        });
+
+                    } else {
+                        // Default rewrite
+                        form.setAttribute("method", "GET");
+                        form.setAttribute(
+                            "action",
+                            "/proxy?url=" + encodeURIComponent(absolute)
+                        );
+                    }
+
+                } catch {}
             }
         });
 
-        // --- Rewrite assets: images, CSS, iframes ---
+        // --- Rewrite assets ---
         document.querySelectorAll("img, link[rel='stylesheet'], iframe").forEach(el => {
             const attr = el.tagName === "LINK" ? "href" : "src";
             const val = el.getAttribute(attr);
+
             if (val && !val.startsWith("data:") && !val.startsWith("javascript")) {
-                const absolute = new URL(val, urlObj);
-                el.setAttribute(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
+                try {
+                    const absolute = new URL(val, urlObj);
+                    el.setAttribute(
+                        attr,
+                        `/proxy?url=${encodeURIComponent(absolute)}`
+                    );
+                } catch {}
             }
         });
 
