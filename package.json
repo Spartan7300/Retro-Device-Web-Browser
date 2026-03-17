@@ -1,14 +1,10 @@
 {
   "name": "web-proxy",
   "version": "1.0.0",
-  "description": "Proxy-based web browsing server",
-  "main": "index.js",
-  "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "main": "server.js",
   "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.7",
+    "cheerio": "^1.0.0"
   }
 }
