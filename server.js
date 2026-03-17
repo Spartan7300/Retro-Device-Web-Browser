@@ -7,10 +7,12 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: true }));
 
+// Convert a URL to proxied version
 function proxify(url) {
   return "/proxy?url=" + encodeURIComponent(url);
 }
 
+// Resolve relative URLs safely
 function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -19,10 +21,11 @@ function resolveUrl(base, relative) {
   }
 }
 
+// Universal proxy route
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
-  // --- Generic Wikipedia search support ---
+  // Generic Wikipedia search support
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -37,14 +40,16 @@ app.all("/proxy", async (req, res) => {
   try {
     const urlObj = new URL(target);
 
+    // Forward GET query parameters (excluding special keys)
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
-        if (key !== "url" && key !== "search" && key !== "language" && key !== "go") {
+        if (!["url", "search", "language", "go"].includes(key)) {
           urlObj.searchParams.set(key, req.query[key]);
         }
       });
     }
 
+    // Fetch page
     const fetchOptions = {
       method: req.method,
       headers: { "User-Agent": "Mozilla/5.0 (OldBrowserProxy)" },
@@ -58,6 +63,7 @@ app.all("/proxy", async (req, res) => {
 
     let response = await fetch(urlObj.toString(), fetchOptions);
 
+    // Handle HTTP redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (location) return res.redirect(proxify(resolveUrl(urlObj, location)));
@@ -67,32 +73,57 @@ app.all("/proxy", async (req, res) => {
     const dom = new JSDOM(html);
     const document = dom.window.document;
 
+    // Base URL for resolving relative paths
     let baseHref = urlObj.toString();
     const baseTag = document.querySelector("base[href]");
     if (baseTag) {
       baseHref = resolveUrl(urlObj, baseTag.getAttribute("href")) || baseHref;
     }
 
+    // Remove external scripts
     document.querySelectorAll("script[src]").forEach((s) => s.remove());
 
-    const urlAttrs = ["href", "src", "action"];
-    document.querySelectorAll("*").forEach((el) => {
-      urlAttrs.forEach((attr) => {
-        const val = el.getAttribute(attr);
-        if (!val) return;
-        if (val.startsWith("data:") || val.startsWith("javascript:") || val.startsWith("#"))
-          return;
+    // Rewrite CSS links carefully: only relative ones through proxy
+    document.querySelectorAll("link[rel='stylesheet']").forEach((el) => {
+      const val = el.getAttribute("href");
+      if (!val) return;
+
+      if (val.startsWith("http")) {
+        // leave absolute CSS as is
+      } else if (val.startsWith("//")) {
+        el.setAttribute("href", "https:" + val);
+      } else {
         const absolute = resolveUrl(baseHref, val);
-        if (absolute) el.setAttribute(attr, proxify(absolute));
-      });
+        if (absolute) el.setAttribute("href", proxify(absolute));
+      }
     });
 
+    // Rewrite assets (images, iframes)
+    document.querySelectorAll("img, iframe").forEach((el) => {
+      const val = el.getAttribute("src");
+      if (!val || val.startsWith("data:") || val.startsWith("javascript:")) return;
+      const absolute = resolveUrl(baseHref, val);
+      if (absolute) el.setAttribute("src", proxify(absolute));
+    });
+
+    // Rewrite all links
+    document.querySelectorAll("a").forEach((el) => {
+      const val = el.getAttribute("href");
+      if (!val || val.startsWith("javascript:") || val.startsWith("#")) return;
+      const absolute = resolveUrl(baseHref, val);
+      if (absolute) el.setAttribute("href", proxify(absolute));
+    });
+
+    // Rewrite all forms (keep method + inputs)
     document.querySelectorAll("form").forEach((form) => {
-      let action = form.getAttribute("action") || baseHref;
+      const action = form.getAttribute("action") || baseHref;
       const absolute = resolveUrl(baseHref, action);
       if (absolute) form.setAttribute("action", proxify(absolute));
+      // force GET if old browsers cannot handle POST? Optional
+      // form.setAttribute("method", "GET");
     });
 
+    // Convert simple JS navigation (onclick location.href)
     document.querySelectorAll("[onclick]").forEach((el) => {
       const code = el.getAttribute("onclick");
       const match = code.match(/location\.href\s*=\s*['"]([^'"]+)['"]/);
@@ -105,6 +136,7 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
+    // Meta refresh redirects
     document.querySelectorAll("meta[http-equiv='refresh']").forEach((meta) => {
       const content = meta.getAttribute("content");
       const match = content.match(/url=(.*)/i);
