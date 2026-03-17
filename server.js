@@ -7,12 +7,10 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: true }));
 
-// Helper to rewrite URLs through proxy
 function proxify(url) {
   return "/proxy?url=" + encodeURIComponent(url);
 }
 
-// Resolve relative URLs
 function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -21,7 +19,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// Asset proxy (images, CSS, JS, iframe, etc.)
+// Asset proxy
 app.get("/asset", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("No URL");
@@ -45,7 +43,7 @@ app.all("/proxy", async (req, res) => {
   try {
     const urlObj = new URL(target);
 
-    // Merge query params for GET requests
+    // Merge GET query params
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
         if (key !== "url") {
@@ -71,27 +69,27 @@ app.all("/proxy", async (req, res) => {
     const response = await fetch(urlObj.toString(), fetchOptions);
     const contentType = response.headers.get("content-type") || "";
 
-    // Stream non-HTML directly
     if (!contentType.includes("text/html")) {
       res.set("Content-Type", contentType);
       return response.body.pipe(res);
     }
 
-    // Load HTML into cheerio
     const html = await response.text();
     const $ = cheerio.load(html);
     const base = urlObj.toString();
 
-    // Rewrite links
+    // Rewrite all <a> links to go through proxy
     $("a").each((i, el) => {
       const href = $(el).attr("href");
       if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
 
       const absolute = resolveUrl(base, href);
-      if (absolute) $(el).attr("href", proxify(absolute));
+      if (absolute) {
+        $(el).attr("href", proxify(absolute));
+      }
     });
 
-    // Rewrite forms
+    // Rewrite all forms to go through proxy
     $("form").each((i, el) => {
       let action = $(el).attr("action") || base;
       const absolute = resolveUrl(base, action) || base;
@@ -118,18 +116,14 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", "/asset?url=" + encodeURIComponent(absolute));
     });
 
-    // --- Transform buttons with location.href to work, keep CSS/layout intact ---
+    // Transform buttons with location.href, keep CSS
     $("button[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
-
-      // Match simple location.href or window.location assignments
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
       if (match) {
         const url = resolveUrl(base, match[1]);
         if (url) {
-          // Remove original onclick
           $(el).removeAttr("onclick");
-          // Add a proxy-safe redirect
           $(el).attr("onclick", `window.location='${proxify(url)}'`);
         }
       }
