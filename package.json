@@ -1,14 +1,17 @@
 {
   "name": "browser-proxy",
   "version": "1.0.0",
-  "description": "Simple web browser proxy",
+  "description": "Simple web browser proxy using Node 22+ native fetch",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "node-fetch": "^3.4.0"
-  }
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT"
 }
