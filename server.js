@@ -5,12 +5,15 @@ const cheerio = require("cheerio");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Parse URL-encoded POST forms
 app.use(express.urlencoded({ extended: true }));
 
+// Helper to rewrite URLs through proxy
 function proxify(url) {
   return "/proxy?url=" + encodeURIComponent(url);
 }
 
+// Helper to resolve relative URLs
 function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -19,7 +22,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// --- Serve CSS with relative URL rewriting
+// Serve CSS files through the proxy with URL rewriting
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
@@ -27,6 +30,7 @@ app.get("/proxy-css", async (req, res) => {
   try {
     const response = await fetch(cssUrl);
     let css = await response.text();
+    // Rewrite any relative URLs inside CSS
     css = css.replace(/url\(([^)]+)\)/g, (match, path) => {
       path = path.replace(/['"]/g, "").trim();
       const absolute = resolveUrl(cssUrl, path);
@@ -40,11 +44,11 @@ app.get("/proxy-css", async (req, res) => {
   }
 });
 
-// --- Universal Proxy
+// Main proxy route
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
-  // Wikipedia search
+  // Wikipedia search support
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -53,9 +57,9 @@ app.all("/proxy", async (req, res) => {
     )}&go=${encodeURIComponent(go)}`;
   }
 
-  // Google search or other sites using 'q'
+  // DuckDuckGo search for any query parameter `q`
   if (!target && req.query.q) {
-    const urlObj = new URL("https://www.google.com/search");
+    const urlObj = new URL("https://duckduckgo.com/");
     Object.keys(req.query).forEach((key) => {
       if (key !== "url") urlObj.searchParams.set(key, req.query[key]);
     });
@@ -68,7 +72,7 @@ app.all("/proxy", async (req, res) => {
   try {
     const urlObj = new URL(target);
 
-    // Preserve query params from GET requests
+    // Preserve query parameters for GET requests
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
         if (!["url", "search", "language", "go"].includes(key)) {
@@ -117,7 +121,7 @@ app.all("/proxy", async (req, res) => {
       const method = ($(form).attr("method") || "GET").toUpperCase();
       $(form).attr("method", method);
 
-      // Preserve all inputs
+      // Preserve inputs
       $(form).find("input, select, textarea").each(() => {});
     });
 
@@ -170,7 +174,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
     });
 
-    // --- Keep scripts intact ---
+    // Send proxied HTML
     res.send($.html());
   } catch (err) {
     console.error(err);
@@ -178,6 +182,7 @@ app.all("/proxy", async (req, res) => {
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 });
