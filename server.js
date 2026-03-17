@@ -19,6 +19,31 @@ function resolveUrl(base, relative) {
   }
 }
 
+// --- Serve CSS with rewritten URLs ---
+app.get("/proxy-css", async (req, res) => {
+  const cssUrl = req.query.url;
+  if (!cssUrl) return res.send("");
+
+  try {
+    const response = await fetch(cssUrl);
+    let css = await response.text();
+
+    // Rewrite relative URLs in CSS
+    css = css.replace(/url\(([^)]+)\)/g, (match, path) => {
+      path = path.replace(/['"]/g, "");
+      const absolute = resolveUrl(cssUrl, path);
+      return `url(${proxify(absolute)})`;
+    });
+
+    res.set("Content-Type", "text/css");
+    res.send(css);
+  } catch (e) {
+    console.error(e);
+    res.send("");
+  }
+});
+
+// --- Universal proxy ---
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
@@ -70,17 +95,20 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
+    // Remove external scripts
     $("script[src]").remove();
 
-    // Rewrite CSS links
+    // Rewrite CSS links through /proxy-css
     $("link[rel='stylesheet']").each((i, el) => {
       let href = $(el).attr("href");
       if (!href) return;
-      if (href.startsWith("http")) return;
-      if (href.startsWith("//")) $(el).attr("href", "https:" + href);
-      else {
+      if (href.startsWith("http")) {
+        $(el).attr("href", `/proxy-css?url=${encodeURIComponent(href)}`);
+      } else if (href.startsWith("//")) {
+        $(el).attr("href", `/proxy-css?url=${encodeURIComponent("https:" + href)}`);
+      } else {
         const absolute = resolveUrl(baseHref, href);
-        if (absolute) $(el).attr("href", proxify(absolute));
+        if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
       }
     });
 
