@@ -19,11 +19,9 @@ function resolveUrl(base, relative) {
   }
 }
 
-// --- Serve CSS with relative URL rewriting
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
-
   try {
     const response = await fetch(cssUrl);
     let css = await response.text();
@@ -40,11 +38,9 @@ app.get("/proxy-css", async (req, res) => {
   }
 });
 
-// --- Universal proxy
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
-  // Wikipedia search support
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -71,7 +67,7 @@ app.all("/proxy", async (req, res) => {
       method: req.method,
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       redirect: "manual",
     };
@@ -83,7 +79,6 @@ app.all("/proxy", async (req, res) => {
 
     let response = await fetch(urlObj.toString(), fetchOptions);
 
-    // Handle redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (location) return res.redirect(proxify(resolveUrl(urlObj, location)));
@@ -96,14 +91,31 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // --- Patch-only rewrites ---
+    // --- Rewrite all forms ---
+    $("form").each((i, form) => {
+      let action = $(form).attr("action") || baseHref;
+      const absolute = resolveUrl(baseHref, action);
+      if (!absolute) return;
 
-    // CSS links
-    $("link[rel='stylesheet']").each((i, el) => {
+      // Force every form to submit through proxy
+      $(form).attr("action", proxify(absolute));
+
+      // Keep original method if possible
+      const method = ($(form).attr("method") || "GET").toUpperCase();
+      $(form).attr("method", method);
+
+      // Keep all inputs intact
+      $(form).find("input, select, textarea").each((i, input) => {
+        // leave as-is, just ensure names/values are intact
+      });
+    });
+
+    // Rewrite links to always go through proxy
+    $("a").each((i, el) => {
       let href = $(el).attr("href");
-      if (!href) return;
-      const absolute = resolveUrl(baseHref, href.startsWith("//") ? "https:" + href : href);
-      if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
+      if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
+      const absolute = resolveUrl(baseHref, href);
+      if (absolute) $(el).attr("href", proxify(absolute));
     });
 
     // Images & iframes
@@ -112,21 +124,6 @@ app.all("/proxy", async (req, res) => {
       if (!src || src.startsWith("data:")) return;
       const absolute = resolveUrl(baseHref, src);
       if (absolute) $(el).attr("src", proxify(absolute));
-    });
-
-    // Forms
-    $("form").each((i, form) => {
-      let action = $(form).attr("action") || baseHref;
-      const absolute = resolveUrl(baseHref, action);
-      if (absolute) $(form).attr("action", proxify(absolute));
-    });
-
-    // Links — **all absolute or relative URLs now proxied**
-    $("a").each((i, el) => {
-      let href = $(el).attr("href");
-      if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
-      const absolute = resolveUrl(baseHref, href);
-      if (absolute) $(el).attr("href", proxify(absolute));
     });
 
     // Buttons with location.href
@@ -154,9 +151,15 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
-    // --- Keep all scripts intact for YouTube and modern sites ---
-    // Only external scripts for very old devices can be removed optionally
+    // CSS links
+    $("link[rel='stylesheet']").each((i, el) => {
+      let href = $(el).attr("href");
+      if (!href) return;
+      const absolute = resolveUrl(baseHref, href.startsWith("//") ? "https:" + href : href);
+      if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
+    });
 
+    // **Keep all scripts intact for popups, YouTube, Google, modern sites**
     res.send($.html());
   } catch (err) {
     console.error(err);
