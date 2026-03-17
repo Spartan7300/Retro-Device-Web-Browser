@@ -23,6 +23,7 @@ function resolveUrl(base, relative) {
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
+
   try {
     const response = await fetch(cssUrl);
     let css = await response.text();
@@ -39,10 +40,11 @@ app.get("/proxy-css", async (req, res) => {
   }
 });
 
+// --- Universal Proxy
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
-  // Wikipedia search support
+  // Wikipedia search
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -51,13 +53,22 @@ app.all("/proxy", async (req, res) => {
     )}&go=${encodeURIComponent(go)}`;
   }
 
+  // Google search or other sites using 'q'
+  if (!target && req.query.q) {
+    const urlObj = new URL("https://www.google.com/search");
+    Object.keys(req.query).forEach((key) => {
+      if (key !== "url") urlObj.searchParams.set(key, req.query[key]);
+    });
+    target = urlObj.toString();
+  }
+
   if (!target) return res.send("No URL provided");
   if (!target.startsWith("http")) target = "https://" + target;
 
   try {
     const urlObj = new URL(target);
 
-    // Preserve query params from GET
+    // Preserve query params from GET requests
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
         if (!["url", "search", "language", "go"].includes(key)) {
@@ -82,6 +93,7 @@ app.all("/proxy", async (req, res) => {
 
     let response = await fetch(urlObj.toString(), fetchOptions);
 
+    // Handle redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (location) return res.redirect(proxify(resolveUrl(urlObj, location)));
@@ -94,31 +106,22 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // --- Rewrite all forms universally ---
+    // --- Rewrite all forms to go through proxy ---
     $("form").each((i, form) => {
       let action = $(form).attr("action") || baseHref;
       let absolute = resolveUrl(baseHref, action);
       if (!absolute) absolute = baseHref;
 
-      // Force form through proxy
       $(form).attr("action", proxify(absolute));
 
-      // Keep original method
       const method = ($(form).attr("method") || "GET").toUpperCase();
       $(form).attr("method", method);
 
-      // Add missing inputs to GET query if action had parameters
-      if (method === "GET") {
-        const actionUrl = new URL(absolute);
-        actionUrl.searchParams.forEach((v, k) => {
-          if ($(form).find(`input[name='${k}']`).length === 0) {
-            $(form).append(`<input type="hidden" name="${k}" value="${v}">`);
-          }
-        });
-      }
+      // Preserve all inputs
+      $(form).find("input, select, textarea").each(() => {});
     });
 
-    // --- Rewrite all links to go through proxy ---
+    // --- Rewrite all links ---
     $("a").each((i, el) => {
       let href = $(el).attr("href");
       if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
@@ -126,7 +129,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", proxify(absolute));
     });
 
-    // Images & iframes
+    // --- Rewrite images & iframes ---
     $("img, iframe").each((i, el) => {
       let src = $(el).attr("src");
       if (!src || src.startsWith("data:")) return;
@@ -134,7 +137,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("src", proxify(absolute));
     });
 
-    // Buttons with location.href
+    // --- Buttons with location.href ---
     $("[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
@@ -149,7 +152,7 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
-    // Meta refresh
+    // --- Meta refresh ---
     $("meta[http-equiv='refresh']").each((i, meta) => {
       const content = $(meta).attr("content");
       const match = content.match(/url=(.*)/i);
@@ -159,7 +162,7 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
-    // CSS links
+    // --- CSS links ---
     $("link[rel='stylesheet']").each((i, el) => {
       let href = $(el).attr("href");
       if (!href) return;
@@ -167,7 +170,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
     });
 
-    // Keep scripts intact
+    // --- Keep scripts intact ---
     res.send($.html());
   } catch (err) {
     console.error(err);
