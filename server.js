@@ -1,71 +1,160 @@
-const express = require("express");
-const { pipeline } = require("stream");
+(function () {
+  const PROXY_PREFIX = "/proxy?url=";
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+  function rewriteUrl(url) {
+    try {
+      if (!url) return url;
 
-// universal proxy handler
-async function handleProxy(req, res) {
-  let target = req.query.url;
+      // Ignore already proxied
+      if (url.startsWith(PROXY_PREFIX)) return url;
 
-  // if no direct URL, but a search query exists, send to DuckDuckGo
-  if (!target && req.query.q) {
-    target = `https://duckduckgo.com/?q=${encodeURIComponent(req.query.q)}`;
+      // Ignore special schemes
+      if (
+        url.startsWith("javascript:") ||
+        url.startsWith("data:") ||
+        url.startsWith("mailto:") ||
+        url.startsWith("tel:")
+      ) return url;
+
+      const absolute = new URL(url, location.href);
+      return PROXY_PREFIX + encodeURIComponent(absolute.href);
+    } catch {
+      return url;
+    }
   }
 
-  // if still nothing, send default to DuckDuckGo blank search
-  if (!target) {
-    target = "https://duckduckgo.com/";
-  }
+  // -------------------------
+  // Rewrite DOM attributes
+  // -------------------------
+  function rewriteAttributes(root = document) {
+    const ATTRS = [
+      ["a", "href"],
+      ["link", "href"],
+      ["img", "src"],
+      ["script", "src"],
+      ["iframe", "src"],
+      ["form", "action"],
+      ["source", "src"],
+      ["video", "src"],
+      ["audio", "src"],
+    ];
 
-  // ensure proper schema
-  if (!/^https?:\/\//i.test(target)) {
-    target = "https://" + target;
-  }
-
-  try {
-    const response = await fetch(target, {
-      method: req.method,
-      headers: {
-        ...req.headers,
-        host: new URL(target).host,
-      },
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : req,
-      redirect: "manual",
+    ATTRS.forEach(([tag, attr]) => {
+      root.querySelectorAll(`${tag}[${attr}]`).forEach(el => {
+        const val = el.getAttribute(attr);
+        if (val) {
+          el.setAttribute(attr, rewriteUrl(val));
+        }
+      });
     });
+  }
 
-    // handle redirects through the proxy
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (location) {
-        const absolute = new URL(location, target).toString();
-        return res.redirect(`/proxy?url=${encodeURIComponent(absolute)}`);
+  // -------------------------
+  // Intercept clicks
+  // -------------------------
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("a");
+    if (!a) return;
+
+    const href = a.getAttribute("href");
+    if (!href) return;
+
+    e.preventDefault();
+    location.href = rewriteUrl(href);
+  });
+
+  // -------------------------
+  // Intercept forms
+  // -------------------------
+  document.addEventListener("submit", (e) => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement)) return;
+
+    e.preventDefault();
+
+    const action = form.getAttribute("action") || location.href;
+    const method = (form.method || "GET").toUpperCase();
+    const formData = new FormData(form);
+
+    if (method === "GET") {
+      const params = new URLSearchParams(formData).toString();
+      const url = action + (action.includes("?") ? "&" : "?") + params;
+      location.href = rewriteUrl(url);
+    } else {
+      fetch(PROXY_PREFIX + encodeURIComponent(action), {
+        method: "POST",
+        body: formData,
+        credentials: "include"
+      }).then(res => res.text())
+        .then(html => {
+          document.open();
+          document.write(html);
+          document.close();
+        });
+    }
+  });
+
+  // -------------------------
+  // Override fetch
+  // -------------------------
+  const originalFetch = window.fetch;
+  window.fetch = function (url, options = {}) {
+    return originalFetch(rewriteUrl(url), {
+      ...options,
+      credentials: "include"
+    });
+  };
+
+  // -------------------------
+  // Override XMLHttpRequest
+  // -------------------------
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    return origOpen.call(this, method, rewriteUrl(url), ...rest);
+  };
+
+  // -------------------------
+  // Override window.open
+  // -------------------------
+  const originalOpen = window.open;
+  window.open = function (url, ...args) {
+    return originalOpen.call(window, rewriteUrl(url), ...args);
+  };
+
+  // -------------------------
+  // History API hook
+  // -------------------------
+  const origPushState = history.pushState;
+  history.pushState = function (state, title, url) {
+    return origPushState.call(history, state, title, rewriteUrl(url));
+  };
+
+  const origReplaceState = history.replaceState;
+  history.replaceState = function (state, title, url) {
+    return origReplaceState.call(history, state, title, rewriteUrl(url));
+  };
+
+  // -------------------------
+  // Mutation observer (dynamic content)
+  // -------------------------
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType === 1) {
+          rewriteAttributes(node);
+        }
       }
     }
+  });
 
-    // forward headers
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() === "content-encoding") return;
-      res.setHeader(key, value);
-    });
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
 
-    res.status(response.status);
-    pipeline(response.body, res, (err) => {
-      if (err) console.error("pipeline error:", err);
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Proxy fetch error");
-  }
-}
+  // -------------------------
+  // Initial run
+  // -------------------------
+  rewriteAttributes();
 
-// bind proxy route
-app.use("/proxy", handleProxy);
-
-// send everything else through proxy handler
-app.use((req, res) => handleProxy(req, res));
-
-// start
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+})();
