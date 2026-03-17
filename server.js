@@ -8,6 +8,14 @@ const PORT = process.env.PORT || 3000;
 app.get("/proxy", async (req, res) => {
     let target = req.query.url;
 
+    // --- Special handling for Wikipedia search forms ---
+    if (!target && req.query.family === "wikipedia") {
+        const search = req.query.search || "";
+        const language = req.query.language || "en";
+        const go = req.query.go || "";
+        target = `https://${language}.wikipedia.org/w/index.php?search=${encodeURIComponent(search)}&go=${encodeURIComponent(go)}`;
+    }
+
     if (!target) {
         return res.send("No URL provided");
     }
@@ -19,10 +27,9 @@ app.get("/proxy", async (req, res) => {
     try {
         const urlObj = new URL(target);
 
-        // --- Forward all query parameters except 'url' ---
+        // --- Forward all query parameters except 'url' and Wikipedia special keys ---
         Object.keys(req.query).forEach(key => {
-            if (key !== "url") {
-                // Use set to preserve the key/value exactly
+            if (key !== "url" && key !== "family" && key !== "search" && key !== "language" && key !== "go") {
                 urlObj.searchParams.set(key, req.query[key]);
             }
         });
@@ -38,7 +45,7 @@ app.get("/proxy", async (req, res) => {
             if (script.src) script.remove();
         });
 
-        // --- Rewrite all links to go through proxy ---
+        // --- Rewrite all links ---
         document.querySelectorAll("a").forEach(link => {
             const href = link.getAttribute("href");
             if (href && !href.startsWith("javascript")) {
