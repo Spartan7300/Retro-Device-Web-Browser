@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Retro Browser</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="browser">
+    <h1>🌐 Retro Browser</h1>
+
+    <form id="form">
+        <input type="text" id="url" placeholder="Enter website..." required>
+        <button type="submit">Go</button>
+    </form>
+</div>
+
+<script>
+const form = document.getElementById("form");
+
+form.addEventListener("submit", function(e) {
+    e.preventDefault();
+    const url = document.getElementById("url").value;
+
+    window.location.href = "https://your-app.onrender.com/proxy?url=" + encodeURIComponent(url);
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,24 @@
+body {
+    font-family: Arial;
+    background: #111;
+    color: white;
+    text-align: center;
+    padding: 50px;
+}
+
+.browser {
+    max-width: 600px;
+    margin: auto;
+}
+
+input {
+    width: 70%;
+    padding: 10px;
+}
+
+button {
+    padding: 10px;
+    background: limegreen;
+    border: none;
+    color: white;
+}
