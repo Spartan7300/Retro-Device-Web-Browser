@@ -19,6 +19,7 @@ function resolveUrl(base, relative) {
   }
 }
 
+// --- Serve CSS with relative URL rewriting
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
@@ -41,6 +42,7 @@ app.get("/proxy-css", async (req, res) => {
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
+  // Wikipedia search support
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -55,6 +57,7 @@ app.all("/proxy", async (req, res) => {
   try {
     const urlObj = new URL(target);
 
+    // Preserve query params from GET
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
         if (!["url", "search", "language", "go"].includes(key)) {
@@ -91,26 +94,31 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // --- Rewrite all forms ---
+    // --- Rewrite all forms universally ---
     $("form").each((i, form) => {
       let action = $(form).attr("action") || baseHref;
-      const absolute = resolveUrl(baseHref, action);
-      if (!absolute) return;
+      let absolute = resolveUrl(baseHref, action);
+      if (!absolute) absolute = baseHref;
 
-      // Force every form to submit through proxy
+      // Force form through proxy
       $(form).attr("action", proxify(absolute));
 
-      // Keep original method if possible
+      // Keep original method
       const method = ($(form).attr("method") || "GET").toUpperCase();
       $(form).attr("method", method);
 
-      // Keep all inputs intact
-      $(form).find("input, select, textarea").each((i, input) => {
-        // leave as-is, just ensure names/values are intact
-      });
+      // Add missing inputs to GET query if action had parameters
+      if (method === "GET") {
+        const actionUrl = new URL(absolute);
+        actionUrl.searchParams.forEach((v, k) => {
+          if ($(form).find(`input[name='${k}']`).length === 0) {
+            $(form).append(`<input type="hidden" name="${k}" value="${v}">`);
+          }
+        });
+      }
     });
 
-    // Rewrite links to always go through proxy
+    // --- Rewrite all links to go through proxy ---
     $("a").each((i, el) => {
       let href = $(el).attr("href");
       if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
@@ -159,7 +167,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
     });
 
-    // **Keep all scripts intact for popups, YouTube, Google, modern sites**
+    // Keep scripts intact
     res.send($.html());
   } catch (err) {
     console.error(err);
