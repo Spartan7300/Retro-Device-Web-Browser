@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Retro Browser</title>
+    <title>Retro Web Browser</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -14,6 +14,8 @@
         <input type="text" id="url" placeholder="Enter website..." required>
         <button type="submit">Go</button>
     </form>
+
+    <p>Browsing via your Render backend proxy.</p>
 </div>
 
 <script>
@@ -23,7 +25,8 @@ form.addEventListener("submit", function(e) {
     e.preventDefault();
     const url = document.getElementById("url").value;
 
-    window.location.href = "https://your-app.onrender.com/proxy?url=" + encodeURIComponent(url);
+    // Point to your Render backend
+    window.location.href = "https://retro-device-web-browser.onrender.com/proxy?url=" + encodeURIComponent(url);
 });
 </script>
 
