@@ -1,26 +1,34 @@
 const express = require("express");
 const fetch = require("node-fetch");
 const { JSDOM } = require("jsdom");
+const cookieParser = require("cookie-parser");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/proxy", async (req, res) => {
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+/**
+ * Convert any URL to proxied version
+ */
+function proxify(url) {
+    return "/proxy?url=" + encodeURIComponent(url);
+}
+
+/**
+ * Resolve URL safely
+ */
+function resolveUrl(base, relative) {
+    try {
+        return new URL(relative, base).toString();
+    } catch {
+        return null;
+    }
+}
+
+app.all("/proxy", async (req, res) => {
     let target = req.query.url;
-
-    // --- Wikipedia special handling ---
-    if (!target && req.query.family === "wikipedia") {
-        const search = req.query.search || "";
-        const language = req.query.language || "en";
-        const go = req.query.go || "";
-        target = `https://${language}.wikipedia.org/w/index.php?search=${encodeURIComponent(search)}&go=${encodeURIComponent(go)}`;
-    }
-
-    // --- Google search handling (NEW) ---
-    if (!target && req.query.q) {
-        const query = encodeURIComponent(req.query.q);
-        target = `https://www.google.com/search?q=${query}`;
-    }
 
     if (!target) {
         return res.send("No URL provided");
@@ -33,94 +41,127 @@ app.get("/proxy", async (req, res) => {
     try {
         const urlObj = new URL(target);
 
-        // --- Forward query params (excluding special ones) ---
-        Object.keys(req.query).forEach(key => {
-            if (!["url", "family", "search", "language", "go", "q"].includes(key)) {
-                urlObj.searchParams.set(key, req.query[key]);
-            }
-        });
+        // --- Forward query params (GET) ---
+        if (req.method === "GET") {
+            Object.keys(req.query).forEach(key => {
+                if (key !== "url") {
+                    urlObj.searchParams.set(key, req.query[key]);
+                }
+            });
+        }
 
-        const response = await fetch(urlObj.toString(), {
+        // --- Forward cookies ---
+        const cookieHeader = req.headers.cookie || "";
+
+        const fetchOptions = {
+            method: req.method,
             headers: {
-                "User-Agent": "Mozilla/5.0 (compatible; OldBrowserProxy/1.0)"
+                "User-Agent": "Mozilla/5.0 (OldBrowserProxy)",
+                "Cookie": cookieHeader
+            },
+            redirect: "manual"
+        };
+
+        // --- Handle POST body ---
+        if (req.method === "POST") {
+            fetchOptions.body = new URLSearchParams(req.body);
+            fetchOptions.headers["Content-Type"] = "application/x-www-form-urlencoded";
+        }
+
+        let response = await fetch(urlObj.toString(), fetchOptions);
+
+        // --- Handle HTTP redirects ---
+        if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get("location");
+            if (location) {
+                const redirectUrl = resolveUrl(urlObj, location);
+                return res.redirect(proxify(redirectUrl));
             }
-        });
+        }
+
+        // --- Pass cookies back ---
+        const setCookie = response.headers.raw()["set-cookie"];
+        if (setCookie) {
+            res.setHeader("set-cookie", setCookie);
+        }
 
         let html = await response.text();
 
         const dom = new JSDOM(html);
         const document = dom.window.document;
 
-        // --- Remove external scripts ---
-        document.querySelectorAll("script").forEach(script => {
-            if (script.src) script.remove();
+        // --- Handle <base> tag ---
+        let baseHref = urlObj.toString();
+        const baseTag = document.querySelector("base[href]");
+        if (baseTag) {
+            baseHref = resolveUrl(urlObj, baseTag.getAttribute("href")) || baseHref;
+        }
+
+        // --- Remove external scripts (but keep inline) ---
+        document.querySelectorAll("script[src]").forEach(s => s.remove());
+
+        // --- Rewrite ALL URL attributes ---
+        const urlAttrs = ["href", "src", "action"];
+
+        document.querySelectorAll("*").forEach(el => {
+            urlAttrs.forEach(attr => {
+                const val = el.getAttribute(attr);
+                if (!val) return;
+
+                if (
+                    val.startsWith("data:") ||
+                    val.startsWith("javascript:") ||
+                    val.startsWith("#")
+                ) return;
+
+                const absolute = resolveUrl(baseHref, val);
+                if (absolute) {
+                    el.setAttribute(attr, proxify(absolute));
+                }
+            });
         });
 
-        // --- Rewrite links ---
-        document.querySelectorAll("a").forEach(link => {
-            const href = link.getAttribute("href");
-            if (href && !href.startsWith("javascript")) {
-                try {
-                    const absolute = new URL(href, urlObj);
-                    link.setAttribute(
-                        "href",
-                        `/proxy?url=${encodeURIComponent(absolute)}`
-                    );
-                } catch {}
-            }
-        });
-
-        // --- Rewrite forms ---
+        // --- Fix forms (preserve method + inputs) ---
         document.querySelectorAll("form").forEach(form => {
-            let action = form.getAttribute("action") || "";
+            let action = form.getAttribute("action") || baseHref;
+            const absolute = resolveUrl(baseHref, action);
 
-            if (!action.startsWith("javascript")) {
-                try {
-                    const absolute = new URL(action, urlObj);
+            if (absolute) {
+                form.setAttribute("action", proxify(absolute));
+            }
 
-                    // Detect Google search form
-                    const searchInput = form.querySelector("input[name='q']");
+            // DO NOT force GET anymore
+        });
 
-                    if (absolute.hostname.includes("google.com") && searchInput) {
-                        // Force simple GET-based search
-                        form.setAttribute("method", "GET");
-                        form.setAttribute("action", "/proxy");
+        // --- Convert JS navigation (onclick etc.) ---
+        document.querySelectorAll("[onclick]").forEach(el => {
+            const code = el.getAttribute("onclick");
 
-                        // Remove all other inputs except 'q'
-                        form.querySelectorAll("input").forEach(input => {
-                            if (input.name !== "q") input.remove();
-                        });
+            // naive detection of location changes
+            const match = code.match(/location\.href\s*=\s*['"]([^'"]+)['"]/);
 
-                    } else {
-                        // Default rewrite
-                        form.setAttribute("method", "GET");
-                        form.setAttribute(
-                            "action",
-                            "/proxy?url=" + encodeURIComponent(absolute)
-                        );
-                    }
-
-                } catch {}
+            if (match) {
+                const absolute = resolveUrl(baseHref, match[1]);
+                if (absolute) {
+                    el.removeAttribute("onclick");
+                    el.setAttribute("href", proxify(absolute));
+                }
             }
         });
 
-        // --- Rewrite assets ---
-        document.querySelectorAll("img, link[rel='stylesheet'], iframe").forEach(el => {
-            const attr = el.tagName === "LINK" ? "href" : "src";
-            const val = el.getAttribute(attr);
-
-            if (val && !val.startsWith("data:") && !val.startsWith("javascript")) {
-                try {
-                    const absolute = new URL(val, urlObj);
-                    el.setAttribute(
-                        attr,
-                        `/proxy?url=${encodeURIComponent(absolute)}`
-                    );
-                } catch {}
+        // --- Handle meta refresh redirects ---
+        document.querySelectorAll("meta[http-equiv='refresh']").forEach(meta => {
+            const content = meta.getAttribute("content");
+            const match = content.match(/url=(.*)/i);
+            if (match) {
+                const absolute = resolveUrl(baseHref, match[1]);
+                if (absolute) {
+                    meta.setAttribute("content", `0; url=${proxify(absolute)}`);
+                }
             }
         });
 
-        res.send(document.documentElement.outerHTML);
+        res.send(dom.serialize());
 
     } catch (err) {
         console.error(err);
