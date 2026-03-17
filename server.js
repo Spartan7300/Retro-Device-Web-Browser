@@ -19,7 +19,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// --- Serve CSS with rewritten URLs ---
+// Serve CSS, rewriting only relative URLs
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
@@ -28,7 +28,7 @@ app.get("/proxy-css", async (req, res) => {
     const response = await fetch(cssUrl);
     let css = await response.text();
 
-    // Rewrite relative URLs in CSS
+    // Only rewrite relative URLs
     css = css.replace(/url\(([^)]+)\)/g, (match, path) => {
       path = path.replace(/['"]/g, "").trim();
       const absolute = resolveUrl(cssUrl, path);
@@ -43,7 +43,7 @@ app.get("/proxy-css", async (req, res) => {
   }
 });
 
-// --- Universal proxy ---
+// Universal proxy — negative/patch-only approach
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
@@ -83,6 +83,7 @@ app.all("/proxy", async (req, res) => {
 
     let response = await fetch(urlObj.toString(), fetchOptions);
 
+    // Handle redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (location) return res.redirect(proxify(resolveUrl(urlObj, location)));
@@ -95,69 +96,67 @@ app.all("/proxy", async (req, res) => {
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // Remove only external scripts to save memory, keep inline scripts
-    $("script[src]").remove();
+    // --- Patch-only rewrites ---
 
-    // Rewrite CSS links through /proxy-css
+    // 1. CSS links — rewrite only if relative/protocol-relative
     $("link[rel='stylesheet']").each((i, el) => {
       let href = $(el).attr("href");
       if (!href) return;
-      if (href.startsWith("http")) {
-        $(el).attr("href", `/proxy-css?url=${encodeURIComponent(href)}`);
-      } else if (href.startsWith("//")) {
-        $(el).attr("href", `/proxy-css?url=${encodeURIComponent("https:" + href)}`);
-      } else {
-        const absolute = resolveUrl(baseHref, href);
+      if (!href.startsWith("http")) {
+        const absolute = resolveUrl(baseHref, href.startsWith("//") ? "https:" + href : href);
         if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
       }
     });
 
-    // Rewrite images & iframes
+    // 2. Images & iframes — rewrite only relative URLs
     $("img, iframe").each((i, el) => {
       let src = $(el).attr("src");
-      if (!src || src.startsWith("data:") || src.startsWith("javascript:")) return;
+      if (!src || src.startsWith("data:") || src.startsWith("http") || src.startsWith("javascript:")) return;
       const absolute = resolveUrl(baseHref, src);
       if (absolute) $(el).attr("src", proxify(absolute));
     });
 
-    // Rewrite links
+    // 3. Forms — only rewrite relative actions
+    $("form").each((i, form) => {
+      let action = $(form).attr("action") || baseHref;
+      if (!action.startsWith("http")) {
+        const absolute = resolveUrl(baseHref, action);
+        if (absolute) $(form).attr("action", proxify(absolute));
+      }
+    });
+
+    // 4. Links — only rewrite relative hrefs
     $("a").each((i, el) => {
       let href = $(el).attr("href");
-      if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
+      if (!href || href.startsWith("http") || href.startsWith("javascript:") || href.startsWith("#")) return;
       const absolute = resolveUrl(baseHref, href);
       if (absolute) $(el).attr("href", proxify(absolute));
     });
 
-    // Rewrite forms
-    $("form").each((i, form) => {
-      let action = $(form).attr("action") || baseHref;
-      const absolute = resolveUrl(baseHref, action);
-      if (absolute) $(form).attr("action", proxify(absolute));
-    });
-
-    // Convert buttons with location.href / window.location JS into clickable links
+    // 5. Buttons with location.href — patch only those
     $("[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
       if (match) {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) {
-          // Keep button in UI, wrap in <a> so it’s clickable
           const elHtml = $.html(el);
           $(el).replaceWith(`<a href="${proxify(absolute)}" style="display:inline-block">${elHtml}</a>`);
         }
       }
     });
 
-    // Meta refresh redirects
+    // 6. Meta refresh — patch only relative URLs
     $("meta[http-equiv='refresh']").each((i, meta) => {
       const content = $(meta).attr("content");
       const match = content.match(/url=(.*)/i);
-      if (match) {
+      if (match && !match[1].startsWith("http")) {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) $(meta).attr("content", `0; url=${proxify(absolute)}`);
       }
     });
+
+    // **Important:** We keep all other scripts, CSS, and layout intact by default
 
     res.send($.html());
   } catch (err) {
