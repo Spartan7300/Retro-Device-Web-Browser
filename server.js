@@ -19,36 +19,32 @@ function resolveUrl(base, relative) {
   }
 }
 
-// --- Asset proxy (ONLY for non-HTML)
+// Asset proxy
 app.get("/asset", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("No URL");
 
   try {
     const response = await fetch(url);
-
     res.set("Content-Type", response.headers.get("content-type") || "application/octet-stream");
     response.body.pipe(res);
-
   } catch (err) {
     console.error(err);
     res.status(500).send("Asset error");
   }
 });
 
-// --- MAIN PROXY
+// Main proxy
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
-
   if (!target) return res.send("No URL provided");
   if (!target.startsWith("http")) target = "https://" + target;
 
   try {
     const urlObj = new URL(target);
 
-    // Merge query params (IMPORTANT for search)
     if (req.method === "GET") {
-      Object.keys(req.query).forEach(key => {
+      Object.keys(req.query).forEach((key) => {
         if (key !== "url") {
           urlObj.searchParams.set(key, req.query[key]);
         }
@@ -59,9 +55,9 @@ app.all("/proxy", async (req, res) => {
       method: req.method,
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
       },
-      redirect: "follow" // ✅ FIXED
+      redirect: "follow",
     };
 
     if (req.method === "POST") {
@@ -72,40 +68,35 @@ app.all("/proxy", async (req, res) => {
     const response = await fetch(urlObj.toString(), fetchOptions);
     const contentType = response.headers.get("content-type") || "";
 
-    // --- NON-HTML → stream directly
     if (!contentType.includes("text/html")) {
       res.set("Content-Type", contentType);
       return response.body.pipe(res);
     }
 
-    // --- HTML → rewrite
     const html = await response.text();
     const $ = cheerio.load(html);
-
     const base = urlObj.toString();
 
-    // --- LINKS
+    // Rewrite links
     $("a").each((i, el) => {
       const href = $(el).attr("href");
       if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
-
       const absolute = resolveUrl(base, href);
       if (absolute) $(el).attr("href", proxify(absolute));
     });
 
-    // --- FORMS (FIXED SEARCH)
+    // Rewrite forms
     $("form").each((i, el) => {
       let action = $(el).attr("action") || base;
       const absolute = resolveUrl(base, action) || base;
 
       $(el).attr("action", proxify(absolute));
-
       const method = ($(el).attr("method") || "GET").toUpperCase();
       $(el).attr("method", method);
     });
 
-    // --- ASSETS (SMART)
-    $("img, script, iframe").each((i, el) => {
+    // Rewrite assets
+    $("img, iframe, script").each((i, el) => {
       const src = $(el).attr("src");
       if (!src || src.startsWith("data:")) return;
 
@@ -121,8 +112,22 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("href", "/asset?url=" + encodeURIComponent(absolute));
     });
 
-    res.send($.html());
+    // --- NEW: Convert buttons that use location.href into <a> links ---
+    $("button[onclick]").each((i, el) => {
+      const code = $(el).attr("onclick");
+      // Match simple location.href = 'URL' patterns
+      const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
+      if (match) {
+        const url = resolveUrl(base, match[1]);
+        if (url) {
+          const innerHtml = $(el).html();
+          // Replace button with styled link
+          $(el).replaceWith(`<a href="${proxify(url)}" style="display:inline-block">${innerHtml}</a>`);
+        }
+      }
+    });
 
+    res.send($.html());
   } catch (err) {
     console.error(err);
     res.status(500).send("Error loading site");
