@@ -6,37 +6,44 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get("/proxy", async (req, res) => {
-    let url = req.query.url;
+    let target = req.query.url;
 
-    if (!url) {
+    if (!target) {
         return res.send("No URL provided");
     }
 
-    if (!url.startsWith("http")) {
-        url = "https://" + url;
+    if (!target.startsWith("http")) {
+        target = "https://" + target;
     }
 
     try {
-        const response = await fetch(url);
+        const urlObj = new URL(target);
+
+        // Forward all additional query parameters (e.g., ?q=search)
+        Object.keys(req.query).forEach(key => {
+            if (key !== "url") {
+                urlObj.searchParams.append(key, req.query[key]);
+            }
+        });
+
+        const response = await fetch(urlObj.toString());
         let html = await response.text();
 
         const dom = new JSDOM(html);
         const document = dom.window.document;
 
-        // --- Remove external scripts but keep inline JS ---
+        // --- Remove external scripts (keep inline scripts for layout) ---
         document.querySelectorAll("script").forEach(script => {
-            if (script.src) {
-                script.remove();
-            }
+            if (script.src) script.remove();
         });
 
-        // --- Rewrite all links to go through proxy ---
+        // --- Rewrite all links ---
         document.querySelectorAll("a").forEach(link => {
             const href = link.getAttribute("href");
             if (href && !href.startsWith("javascript")) {
                 link.setAttribute(
                     "href",
-                    `/proxy?url=${encodeURIComponent(new URL(href, url))}`
+                    `/proxy?url=${encodeURIComponent(new URL(href, urlObj))}`
                 );
             }
         });
@@ -45,26 +52,26 @@ app.get("/proxy", async (req, res) => {
         document.querySelectorAll("form").forEach(form => {
             let action = form.getAttribute("action") || "";
             if (!action.startsWith("javascript")) {
-                const absolute = new URL(action, url);
-                form.setAttribute("action", "/proxy?url=" + encodeURIComponent(absolute));
+                const absolute = new URL(action, urlObj);
                 form.setAttribute("method", "GET"); // force GET for old devices
+                form.setAttribute(
+                    "action",
+                    "/proxy?url=" + encodeURIComponent(absolute)
+                );
             }
         });
 
-        // --- Rewrite images, CSS, and iframes ---
+        // --- Rewrite assets: images, CSS, iframes ---
         document.querySelectorAll("img, link[rel='stylesheet'], iframe").forEach(el => {
             const attr = el.tagName === "LINK" ? "href" : "src";
-            const urlAttr = el.getAttribute(attr);
-            if (urlAttr && !urlAttr.startsWith("data:") && !urlAttr.startsWith("javascript")) {
-                const absolute = new URL(urlAttr, url);
+            const val = el.getAttribute(attr);
+            if (val && !val.startsWith("data:") && !val.startsWith("javascript")) {
+                const absolute = new URL(val, urlObj);
                 el.setAttribute(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
             }
         });
 
-        // Optional: remove modern CSS that breaks old browsers (like flex/grid)
-        document.querySelectorAll("style, link[rel='stylesheet']").forEach(el => {
-            // could process stylesheets here if desired for old-device simplification
-        });
+        // Optional: further CSS simplification for very old browsers could go here
 
         res.send(document.documentElement.outerHTML);
 
