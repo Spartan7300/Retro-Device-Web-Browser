@@ -135,22 +135,16 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(form).attr("action", proxify(absolute));
     });
 
-    // Convert onclick navigation for links
+    // Convert buttons with location.href / window.location to links
     $("[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
-
-      // Handle standard location.href or window.location
-      let match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
+      const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
       if (match) {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) {
-          // If element is a button, replace with <a> to preserve clickable behavior
-          if ($(el).is("button")) {
-            $(el).replaceWith(`<a href="${proxify(absolute)}">${$(el).text()}</a>`);
-          } else {
-            $(el).removeAttr("onclick");
-            $(el).attr("href", proxify(absolute));
-          }
+          // Keep the original element in UI
+          const elHtml = $.html(el);
+          $(el).replaceWith(`<a href="${proxify(absolute)}" style="display:inline-block">${elHtml}</a>`);
         }
       }
     });
