@@ -19,10 +19,11 @@ app.get("/proxy", async (req, res) => {
     try {
         const urlObj = new URL(target);
 
-        // Forward all additional query parameters (e.g., ?q=search)
+        // --- Forward all query parameters except 'url' ---
         Object.keys(req.query).forEach(key => {
             if (key !== "url") {
-                urlObj.searchParams.append(key, req.query[key]);
+                // Use set to preserve the key/value exactly
+                urlObj.searchParams.set(key, req.query[key]);
             }
         });
 
@@ -32,12 +33,12 @@ app.get("/proxy", async (req, res) => {
         const dom = new JSDOM(html);
         const document = dom.window.document;
 
-        // --- Remove external scripts (keep inline scripts for layout) ---
+        // --- Remove external scripts but keep inline JS ---
         document.querySelectorAll("script").forEach(script => {
             if (script.src) script.remove();
         });
 
-        // --- Rewrite all links ---
+        // --- Rewrite all links to go through proxy ---
         document.querySelectorAll("a").forEach(link => {
             const href = link.getAttribute("href");
             if (href && !href.startsWith("javascript")) {
@@ -70,8 +71,6 @@ app.get("/proxy", async (req, res) => {
                 el.setAttribute(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
             }
         });
-
-        // Optional: further CSS simplification for very old browsers could go here
 
         res.send(document.documentElement.outerHTML);
 
