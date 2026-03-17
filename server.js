@@ -19,7 +19,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// Serve CSS, rewriting only relative URLs
+// --- Serve CSS with relative URL rewriting
 app.get("/proxy-css", async (req, res) => {
   const cssUrl = req.query.url;
   if (!cssUrl) return res.send("");
@@ -27,14 +27,11 @@ app.get("/proxy-css", async (req, res) => {
   try {
     const response = await fetch(cssUrl);
     let css = await response.text();
-
-    // Only rewrite relative URLs
     css = css.replace(/url\(([^)]+)\)/g, (match, path) => {
       path = path.replace(/['"]/g, "").trim();
       const absolute = resolveUrl(cssUrl, path);
       return absolute ? `url(${proxify(absolute)})` : match;
     });
-
     res.set("Content-Type", "text/css");
     res.send(css);
   } catch (e) {
@@ -43,7 +40,7 @@ app.get("/proxy-css", async (req, res) => {
   }
 });
 
-// Universal proxy — negative/patch-only approach
+// --- Universal proxy
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
@@ -72,7 +69,10 @@ app.all("/proxy", async (req, res) => {
 
     const fetchOptions = {
       method: req.method,
-      headers: { "User-Agent": "Mozilla/5.0 (OldBrowserProxy)" },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
       redirect: "manual",
     };
 
@@ -98,42 +98,38 @@ app.all("/proxy", async (req, res) => {
 
     // --- Patch-only rewrites ---
 
-    // 1. CSS links — rewrite only if relative/protocol-relative
+    // CSS links
     $("link[rel='stylesheet']").each((i, el) => {
       let href = $(el).attr("href");
       if (!href) return;
-      if (!href.startsWith("http")) {
-        const absolute = resolveUrl(baseHref, href.startsWith("//") ? "https:" + href : href);
-        if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
-      }
+      const absolute = resolveUrl(baseHref, href.startsWith("//") ? "https:" + href : href);
+      if (absolute) $(el).attr("href", `/proxy-css?url=${encodeURIComponent(absolute)}`);
     });
 
-    // 2. Images & iframes — rewrite only relative URLs
+    // Images & iframes
     $("img, iframe").each((i, el) => {
       let src = $(el).attr("src");
-      if (!src || src.startsWith("data:") || src.startsWith("http") || src.startsWith("javascript:")) return;
+      if (!src || src.startsWith("data:")) return;
       const absolute = resolveUrl(baseHref, src);
       if (absolute) $(el).attr("src", proxify(absolute));
     });
 
-    // 3. Forms — only rewrite relative actions
+    // Forms
     $("form").each((i, form) => {
       let action = $(form).attr("action") || baseHref;
-      if (!action.startsWith("http")) {
-        const absolute = resolveUrl(baseHref, action);
-        if (absolute) $(form).attr("action", proxify(absolute));
-      }
+      const absolute = resolveUrl(baseHref, action);
+      if (absolute) $(form).attr("action", proxify(absolute));
     });
 
-    // 4. Links — only rewrite relative hrefs
+    // Links — **all absolute or relative URLs now proxied**
     $("a").each((i, el) => {
       let href = $(el).attr("href");
-      if (!href || href.startsWith("http") || href.startsWith("javascript:") || href.startsWith("#")) return;
+      if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
       const absolute = resolveUrl(baseHref, href);
       if (absolute) $(el).attr("href", proxify(absolute));
     });
 
-    // 5. Buttons with location.href — patch only those
+    // Buttons with location.href
     $("[onclick]").each((i, el) => {
       const code = $(el).attr("onclick");
       const match = code.match(/(?:location\.href|window\.location)\s*=\s*['"]([^'"]+)['"]/);
@@ -141,22 +137,25 @@ app.all("/proxy", async (req, res) => {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) {
           const elHtml = $.html(el);
-          $(el).replaceWith(`<a href="${proxify(absolute)}" style="display:inline-block">${elHtml}</a>`);
+          $(el).replaceWith(
+            `<a href="${proxify(absolute)}" style="display:inline-block">${elHtml}</a>`
+          );
         }
       }
     });
 
-    // 6. Meta refresh — patch only relative URLs
+    // Meta refresh
     $("meta[http-equiv='refresh']").each((i, meta) => {
       const content = $(meta).attr("content");
       const match = content.match(/url=(.*)/i);
-      if (match && !match[1].startsWith("http")) {
+      if (match) {
         const absolute = resolveUrl(baseHref, match[1]);
         if (absolute) $(meta).attr("content", `0; url=${proxify(absolute)}`);
       }
     });
 
-    // **Important:** We keep all other scripts, CSS, and layout intact by default
+    // --- Keep all scripts intact for YouTube and modern sites ---
+    // Only external scripts for very old devices can be removed optionally
 
     res.send($.html());
   } catch (err) {
