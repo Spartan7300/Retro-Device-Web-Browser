@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Retro Web Browser</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="browser">
+    <div class="toolbar">
+        <h1>🌐 Retro Browser</h1>
+        <form action="/proxy" method="GET">
+            <input 
+                type="text" 
+                name="url" 
+                placeholder="Enter a website (e.g. https://example.com)" 
+                required
+            >
+            <button type="submit">Go</button>
+        </form>
+    </div>
+
+    <div class="content">
+        <p>Enter a URL above to browse simplified websites.</p>
+    </div>
+</div>
+
+</body>
+</html>
