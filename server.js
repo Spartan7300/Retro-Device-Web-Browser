@@ -7,12 +7,10 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: true }));
 
-// Convert URL to proxied version
 function proxify(url) {
   return "/proxy?url=" + encodeURIComponent(url);
 }
 
-// Resolve relative URLs safely
 function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -24,7 +22,7 @@ function resolveUrl(base, relative) {
 app.all("/proxy", async (req, res) => {
   let target = req.query.url;
 
-  // Generic Wikipedia search support
+  // Wikipedia search support
   if (!target && req.query.search) {
     const language = req.query.language || "en";
     const go = req.query.go || "";
@@ -39,7 +37,6 @@ app.all("/proxy", async (req, res) => {
   try {
     const urlObj = new URL(target);
 
-    // Forward GET query params
     if (req.method === "GET") {
       Object.keys(req.query).forEach((key) => {
         if (!["url", "search", "language", "go"].includes(key)) {
@@ -61,30 +58,25 @@ app.all("/proxy", async (req, res) => {
 
     let response = await fetch(urlObj.toString(), fetchOptions);
 
-    // Handle redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (location) return res.redirect(proxify(resolveUrl(urlObj, location)));
     }
 
     const html = await response.text();
-
-    // Load HTML in Cheerio (lightweight)
     const $ = cheerio.load(html);
 
-    // Base URL for relative paths
     let baseHref = urlObj.toString();
     const baseTag = $("base[href]").attr("href");
     if (baseTag) baseHref = resolveUrl(urlObj, baseTag) || baseHref;
 
-    // Remove external scripts
     $("script[src]").remove();
 
-    // Rewrite CSS links carefully
+    // Rewrite CSS links
     $("link[rel='stylesheet']").each((i, el) => {
       let href = $(el).attr("href");
       if (!href) return;
-      if (href.startsWith("http")) return; // leave absolute
+      if (href.startsWith("http")) return;
       if (href.startsWith("//")) $(el).attr("href", "https:" + href);
       else {
         const absolute = resolveUrl(baseHref, href);
@@ -92,7 +84,7 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
-    // Rewrite images, iframes
+    // Rewrite images & iframes
     $("img, iframe").each((i, el) => {
       let src = $(el).attr("src");
       if (!src || src.startsWith("data:") || src.startsWith("javascript:")) return;
@@ -100,7 +92,7 @@ app.all("/proxy", async (req, res) => {
       if (absolute) $(el).attr("src", proxify(absolute));
     });
 
-    // Rewrite all links
+    // Rewrite links
     $("a").each((i, el) => {
       let href = $(el).attr("href");
       if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
@@ -128,7 +120,7 @@ app.all("/proxy", async (req, res) => {
       }
     });
 
-    // Meta refresh
+    // Meta refresh redirects
     $("meta[http-equiv='refresh']").each((i, meta) => {
       const content = $(meta).attr("content");
       const match = content.match(/url=(.*)/i);
