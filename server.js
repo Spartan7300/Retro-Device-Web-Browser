@@ -108,8 +108,23 @@ function transformJS(src, proxyBase) {
 
 // ─── HTML TRANSFORM ─────────────────────────────────────────────
 
+// Safe cheerio each() wrapper — skips elements that throw (e.g. namespaced attrs)
+function safeEach($, selector, fn) {
+  try {
+    $(selector).each(function () {
+      try { fn.call(this); } catch {}
+    });
+  } catch {}
+}
+
 function transformHTML(html, targetUrl, proxyBase) {
-  const $ = cheerio.load(html, { decodeEntities: false });
+  // Strip namespaced attributes before cheerio sees them — css-select crashes on them
+  html = html.replace(/<[^>]+>/g, tag =>
+    tag.replace(/\s[\w-]+:[\w-]+=["'][^"']*["']/g, '')   // remove ns:attr="val"
+       .replace(/\s[\w-]+:[\w-]+(?=[\s>\/])/g, '')        // remove bare ns:attr
+  );
+
+  const $ = cheerio.load(html, { decodeEntities: false, xmlMode: false });
 
   // Remove incompatible meta tags
   $('meta[name="viewport"]').remove();
@@ -182,7 +197,7 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
 `);
 
   // ── Links ──
-  $('a[href]').each(function () {
+  safeEach($, 'a[href]', function () {
     const href = $(this).attr('href');
     if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('data:')) return;
     const abs = resolveUrl(targetUrl, href);
@@ -190,25 +205,21 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
   });
 
   // ── Forms ──
-  $('form').each(function () {
+  safeEach($, 'form', function () {
     const action = $(this).attr('action') || targetUrl;
     const method = ($(this).attr('method') || 'GET').toUpperCase();
     const abs = resolveUrl(targetUrl, action);
 
     if (method === 'GET') {
-      // For GET forms we can proxy via /proxy — we'll let the form submit normally
-      // but point action at our /form-get handler which redirects to /proxy
       $(this).attr('action', `${proxyBase}/form-get`);
-      // Inject a hidden field with the real target URL
       $(this).prepend(`<input type="hidden" name="__proxy_url" value="${abs}">`);
     } else {
-      // POST forms
       $(this).attr('action', `${proxyBase}/form-post?url=${encodeURIComponent(abs)}`);
     }
   });
 
   // ── Script src ──
-  $('script[src]').each(function () {
+  safeEach($, 'script[src]', function () {
     const src = $(this).attr('src');
     if (!src || src.startsWith('data:')) return;
     const abs = resolveUrl(targetUrl, src);
@@ -216,13 +227,13 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
   });
 
   // ── Inline scripts ──
-  $('script:not([src])').each(function () {
+  safeEach($, 'script:not([src])', function () {
     const content = $(this).html() || '';
     $(this).html(transformJS(content, proxyBase));
   });
 
   // ── Stylesheets ──
-  $('link[rel="stylesheet"]').each(function () {
+  safeEach($, 'link[rel="stylesheet"]', function () {
     const href = $(this).attr('href');
     if (!href || href.startsWith('data:')) return;
     const abs = resolveUrl(targetUrl, href);
@@ -230,7 +241,7 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
   });
 
   // ── Inline styles ──
-  $('[style]').each(function () {
+  safeEach($, '[style]', function () {
     const style = $(this).attr('style') || '';
     const rewritten = style.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
       if (u.startsWith('data:') || u.startsWith('#')) return match;
@@ -240,18 +251,16 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
     $(this).attr('style', rewritten);
   });
 
-  // ── Images / media / iframe src ──
+  // ── Images / media src ──
   const srcAttrs = [
     ['img', 'src'], ['img', 'data-src'], ['source', 'src'], ['source', 'srcset'],
-    ['video', 'src'], ['audio', 'src'], ['track', 'src'],
-    ['input[type="image"]', 'src']
+    ['video', 'src'], ['audio', 'src'], ['track', 'src']
   ];
   for (const [sel, attr] of srcAttrs) {
-    $(sel).each(function () {
+    safeEach($, sel, function () {
       const val = $(this).attr(attr);
       if (!val || val.startsWith('data:')) return;
       if (attr === 'srcset') {
-        // srcset="url1 1x, url2 2x"
         const rewritten = val.split(',').map(part => {
           const [u, ...rest] = part.trim().split(/\s+/);
           const abs = resolveUrl(targetUrl, u);
@@ -266,19 +275,14 @@ if (!window.localStorage) { try { window.localStorage = { getItem:function(){ret
   }
 
   // ── iframes ──
-  $('iframe[src]').each(function () {
+  safeEach($, 'iframe[src]', function () {
     const src = $(this).attr('src');
     if (!src || src.startsWith('data:') || src.startsWith('javascript:')) return;
     const abs = resolveUrl(targetUrl, src);
     $(this).attr('src', proxyUrl(abs, proxyBase));
   });
 
-  // ── Simplify layout for 3DS: strip complex/broken elements ──
-  $('svg use[*|href]').each(function () {
-    // External SVG sprites won't load; skip
-    const href = $(this).attr('xlink:href') || $(this).attr('href') || '';
-    if (href.startsWith('http') || href.startsWith('/')) $(this).remove();
-  });
+  // ── Strip external SVG sprite references (already scrubbed from markup above) ──
 
   return $.html();
 }
@@ -378,7 +382,12 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const html = response.data.toString('utf-8');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(transformHTML(html, targetUrl, proxyBase));
+      try {
+        res.send(transformHTML(html, targetUrl, proxyBase));
+      } catch (transformErr) {
+        // Fallback: send raw HTML with a warning banner
+        res.send(`<!-- 3DS Proxy: transform error: ${transformErr.message} -->\n` + html);
+      }
     } else if (contentType.includes('text/css')) {
       const rawCss = response.data.toString('utf-8');
       res.setHeader('Content-Type', 'text/css; charset=utf-8');
