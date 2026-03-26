@@ -2,63 +2,82 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const css = require('css');
-const url = require('url');
+const urlModule = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ─── USER AGENT ─────────────────────────────────────────────────
 const MODERN_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/120.0.0.0 Safari/537.36';
 
-// ─── SEARCH INSTANCES (fallback system) ─────────────────────────
-
+// ─── SEARCH INSTANCES ───────────────────────────────────────────
 const INSTANCES = [
   'https://searx.be',
   'https://searx.tiekoetter.com',
-  'https://search.bus-hit.me'
+  'https://search.bus-hit.me',
+  'https://paulgo.io',
+  'https://searx.info'
 ];
 
 async function fetchSearch(q) {
   for (const instance of INSTANCES) {
     try {
-      const urlSearch = `${instance}/search?q=${encodeURIComponent(q)}&format=json`;
-      const r = await axios.get(urlSearch, {
+      const r = await axios.get(`${instance}/search`, {
+        params: { q, format: 'json' },
         headers: { 'User-Agent': MODERN_UA },
-        timeout: 6000
+        timeout: 7000
       });
-
       if (r.data && r.data.results) return r.data;
     } catch {}
   }
   throw new Error('All search instances failed');
 }
 
-// ─── HELPERS ─────────────────────────────────────────
+// ─── URL HELPERS ────────────────────────────────────────────────
 
 function resolveUrl(base, relative) {
   try {
     if (!relative) return base;
-
+    if (relative.startsWith('data:') || relative.startsWith('javascript:')) return relative;
     if (relative.startsWith('//')) {
-      const b = new url.URL(base);
+      const b = new urlModule.URL(base);
       return `${b.protocol}${relative}`;
     }
-
-    return new url.URL(relative, base).href;
+    return new urlModule.URL(relative, base).href;
   } catch {
     return relative;
   }
 }
 
-// ─── TRANSFORMS ─────────────────────────────────────
+// Build a proxied URL for a given absolute target URL
+function proxyUrl(abs, proxyBase) {
+  return `${proxyBase}/proxy?url=${encodeURIComponent(abs)}`;
+}
+
+// ─── CSS TRANSFORM ──────────────────────────────────────────────
 
 function transformCSS(rawCss, baseUrl, proxyBase) {
-  rawCss = rawCss.replace(/url\(['"]?([^'")]+)['"]?\)/g, (match, u) => {
-    if (u.startsWith('data:')) return match;
+  // Rewrite url() references
+  rawCss = rawCss.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
+    u = u.trim();
+    if (u.startsWith('data:') || u.startsWith('#')) return match;
     const abs = resolveUrl(baseUrl, u);
     return `url('${proxyBase}/resource?url=${encodeURIComponent(abs)}')`;
+  });
+
+  // Rewrite @import "url" and @import url()
+  rawCss = rawCss.replace(/@import\s+['"]([^'"]+)['"]/g, (match, u) => {
+    if (u.startsWith('data:')) return match;
+    const abs = resolveUrl(baseUrl, u);
+    return `@import '${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}'`;
+  });
+  rawCss = rawCss.replace(/@import\s+url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
+    if (u.startsWith('data:')) return match;
+    const abs = resolveUrl(baseUrl, u);
+    return `@import url('${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}')`;
   });
 
   try {
@@ -68,105 +87,274 @@ function transformCSS(rawCss, baseUrl, proxyBase) {
   }
 }
 
-function transformJS(src) {
+// ─── JS TRANSFORM ───────────────────────────────────────────────
+
+function transformJS(src, proxyBase) {
+  if (!src) return src;
   try {
-    return src
+    src = src
       .replace(/\b(const|let)\b/g, 'var')
-      .replace(/window\.location\s*=\s*['"][^'"]*unsupported[^'"]*['"]/gi, '// blocked');
+      // Rewrite location.href = / window.location = assignments to absolute URLs
+      .replace(/(window\.location\.href\s*=\s*|window\.location\s*=\s*|location\.href\s*=\s*)(['"])(https?:\/\/[^'"]+)(['"])/g,
+        (m, pre, q1, u, q2) => `${pre}${q1}${proxyBase}/proxy?url=${encodeURIComponent(u)}${q2}`)
+      // Block unsupported browser detection
+      .replace(/\b(window\.location\s*=\s*['"][^'"]*unsupported[^'"]*['"])/gi, '/* blocked */')
+      .replace(/document\.write\s*\(/g, 'void (');  // document.write kills old browsers
+    return src;
   } catch {
     return src;
   }
 }
 
+// ─── HTML TRANSFORM ─────────────────────────────────────────────
+
 function transformHTML(html, targetUrl, proxyBase) {
   const $ = cheerio.load(html, { decodeEntities: false });
 
+  // Remove incompatible meta tags
   $('meta[name="viewport"]').remove();
   $('meta[http-equiv="X-UA-Compatible"]').remove();
+  $('meta[http-equiv="Content-Security-Policy"]').remove();
 
-  // Remove basic "unsupported browser" scripts
+  // Remove browser-check / upgrade scripts
   $('script').each(function () {
     const content = $(this).html() || '';
-    if (content.includes('unsupported browser') || content.includes('please upgrade')) {
+    if (
+      content.includes('unsupported browser') ||
+      content.includes('please upgrade') ||
+      content.includes('browserupgrade') ||
+      content.includes('outdated browser')
+    ) {
       $(this).remove();
     }
   });
 
-  // Inject polyfills
+  // Remove noscript blocks (they confuse old browsers)
+  $('noscript').remove();
+
+  // Inject compatibility shims at top of <head>
   $('head').prepend(`
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="viewport" content="width=400">
 <script>
-navigator.userAgent='${MODERN_UA}';
-window.chrome={};
-window.CSS={};
-window.navigator.webdriver=false;
-window.Promise=window.Promise||function(fn){this.then=function(){return this};this.catch=function(){return this}};
-window.fetch=window.fetch||function(){return new Promise(function(){})};
+// 3DS Proxy Shims
+try { navigator.__defineGetter__('userAgent', function(){ return '${MODERN_UA.replace(/'/g, "\\'")}'; }); } catch(e){}
+window.chrome = window.chrome || {};
+window.CSS = window.CSS || { supports: function(){ return false; } };
+if (!window.Promise) {
+  window.Promise = function(fn) {
+    this.then = function(cb) { return this; };
+    this.catch = function(cb) { return this; };
+  };
+  window.Promise.resolve = function(v) { return new window.Promise(function(){}); };
+  window.Promise.reject = function(v) { return new window.Promise(function(){}); };
+}
+if (!window.fetch) {
+  window.fetch = function(url, opts) {
+    return new window.Promise(function(){});
+  };
+}
+if (!Array.prototype.forEach) {
+  Array.prototype.forEach = function(fn) { for(var i=0;i<this.length;i++) fn(this[i],i,this); };
+}
+if (!Object.assign) {
+  Object.assign = function(t) {
+    for(var i=1;i<arguments.length;i++){var s=arguments[i];for(var k in s){if(Object.prototype.hasOwnProperty.call(s,k))t[k]=s[k];}}
+    return t;
+  };
+}
+if (!window.history) window.history = { pushState: function(){}, replaceState: function(){} };
+if (!window.sessionStorage) { try { window.sessionStorage = { getItem:function(){return null;}, setItem:function(){}, removeItem:function(){} }; } catch(e){} }
+if (!window.localStorage) { try { window.localStorage = { getItem:function(){return null;}, setItem:function(){}, removeItem:function(){} }; } catch(e){} }
+// Polyfill pushState to proxy new navigations
+(function() {
+  var _push = history.pushState;
+  history.pushState = function(state, title, url) {
+    if (url) {
+      var abs = url.indexOf('http') === 0 ? url : '${proxyBase}/proxy?url=' + encodeURIComponent(new(function URL(u,b){this.href=(b||'')+u;})(url,'${targetUrl}').href);
+      window.location.href = '${proxyBase}/proxy?url=' + encodeURIComponent(abs);
+      return;
+    }
+    return _push.apply(this, arguments);
+  };
+})();
 </script>
 `);
 
-  // Links → proxy
+  // ── Links ──
   $('a[href]').each(function () {
     const href = $(this).attr('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+    if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('data:')) return;
     const abs = resolveUrl(targetUrl, href);
-    $(this).attr('href', `${proxyBase}/proxy?url=${encodeURIComponent(abs)}`);
+    $(this).attr('href', proxyUrl(abs, proxyBase));
   });
 
-  // Forms → proxy
-  $('form[action]').each(function () {
-    const abs = resolveUrl(targetUrl, $(this).attr('action'));
-    $(this).attr('action', `${proxyBase}/form?url=${encodeURIComponent(abs)}`);
-  });
+  // ── Forms ──
+  $('form').each(function () {
+    const action = $(this).attr('action') || targetUrl;
+    const method = ($(this).attr('method') || 'GET').toUpperCase();
+    const abs = resolveUrl(targetUrl, action);
 
-  // Scripts
-  $('script').each(function () {
-    const src = $(this).attr('src');
-    if (src) {
-      const abs = resolveUrl(targetUrl, src);
-      $(this).attr('src', `${proxyBase}/js?url=${encodeURIComponent(abs)}`);
+    if (method === 'GET') {
+      // For GET forms we can proxy via /proxy — we'll let the form submit normally
+      // but point action at our /form-get handler which redirects to /proxy
+      $(this).attr('action', `${proxyBase}/form-get`);
+      // Inject a hidden field with the real target URL
+      $(this).prepend(`<input type="hidden" name="__proxy_url" value="${abs}">`);
     } else {
-      $(this).html(transformJS($(this).html() || ''));
+      // POST forms
+      $(this).attr('action', `${proxyBase}/form-post?url=${encodeURIComponent(abs)}`);
     }
   });
 
-  // CSS
+  // ── Script src ──
+  $('script[src]').each(function () {
+    const src = $(this).attr('src');
+    if (!src || src.startsWith('data:')) return;
+    const abs = resolveUrl(targetUrl, src);
+    $(this).attr('src', `${proxyBase}/js?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(targetUrl)}`);
+  });
+
+  // ── Inline scripts ──
+  $('script:not([src])').each(function () {
+    const content = $(this).html() || '';
+    $(this).html(transformJS(content, proxyBase));
+  });
+
+  // ── Stylesheets ──
   $('link[rel="stylesheet"]').each(function () {
-    const abs = resolveUrl(targetUrl, $(this).attr('href'));
-    $(this).attr('href', `${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(targetUrl)}`);
+    const href = $(this).attr('href');
+    if (!href || href.startsWith('data:')) return;
+    const abs = resolveUrl(targetUrl, href);
+    $(this).attr('href', `${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}`);
+  });
+
+  // ── Inline styles ──
+  $('[style]').each(function () {
+    const style = $(this).attr('style') || '';
+    const rewritten = style.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
+      if (u.startsWith('data:') || u.startsWith('#')) return match;
+      const abs = resolveUrl(targetUrl, u);
+      return `url('${proxyBase}/resource?url=${encodeURIComponent(abs)}')`;
+    });
+    $(this).attr('style', rewritten);
+  });
+
+  // ── Images / media / iframe src ──
+  const srcAttrs = [
+    ['img', 'src'], ['img', 'data-src'], ['source', 'src'], ['source', 'srcset'],
+    ['video', 'src'], ['audio', 'src'], ['track', 'src'],
+    ['input[type="image"]', 'src']
+  ];
+  for (const [sel, attr] of srcAttrs) {
+    $(sel).each(function () {
+      const val = $(this).attr(attr);
+      if (!val || val.startsWith('data:')) return;
+      if (attr === 'srcset') {
+        // srcset="url1 1x, url2 2x"
+        const rewritten = val.split(',').map(part => {
+          const [u, ...rest] = part.trim().split(/\s+/);
+          const abs = resolveUrl(targetUrl, u);
+          return [`${proxyBase}/resource?url=${encodeURIComponent(abs)}`, ...rest].join(' ');
+        }).join(', ');
+        $(this).attr(attr, rewritten);
+      } else {
+        const abs = resolveUrl(targetUrl, val);
+        $(this).attr(attr, `${proxyBase}/resource?url=${encodeURIComponent(abs)}`);
+      }
+    });
+  }
+
+  // ── iframes ──
+  $('iframe[src]').each(function () {
+    const src = $(this).attr('src');
+    if (!src || src.startsWith('data:') || src.startsWith('javascript:')) return;
+    const abs = resolveUrl(targetUrl, src);
+    $(this).attr('src', proxyUrl(abs, proxyBase));
+  });
+
+  // ── Simplify layout for 3DS: strip complex/broken elements ──
+  $('svg use[*|href]').each(function () {
+    // External SVG sprites won't load; skip
+    const href = $(this).attr('xlink:href') || $(this).attr('href') || '';
+    if (href.startsWith('http') || href.startsWith('/')) $(this).remove();
   });
 
   return $.html();
 }
 
-// ─── HOME ───────────────────────────────────────────
+// ─── AXIOS HELPER (follows redirects through proxy) ─────────────
+
+async function proxyFetch(targetUrl, options = {}) {
+  return await axios({
+    url: targetUrl,
+    method: options.method || 'GET',
+    headers: {
+      'User-Agent': MODERN_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate',
+      ...(options.headers || {})
+    },
+    data: options.data,
+    params: options.params,
+    responseType: 'arraybuffer',
+    maxRedirects: 0,                          // We handle redirects manually
+    validateStatus: s => true,               // Accept all status codes
+    timeout: 15000,
+    decompress: true
+  });
+}
+
+// ─── HOME ───────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.send(`
-<h2>3DS Proxy</h2>
-<form method="GET" action="/proxy" onsubmit="return go(this)">
-<input name="url" style="width:80%">
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="viewport" content="width=400">
+<title>3DS Proxy</title>
+<style>
+body { font-family: sans-serif; padding: 10px; background: #eee; }
+h2 { color: #336; }
+input[name=url] { width: 75%; padding: 4px; font-size: 14px; }
+input[type=submit] { padding: 4px 10px; font-size: 14px; }
+</style>
+</head>
+<body>
+<h2>3DS Web Proxy</h2>
+<form method="GET" action="/go">
+<input name="q" placeholder="Enter URL or search term" style="width:75%">
 <input type="submit" value="Go">
 </form>
-<script>
-function go(f){
-  var v=f.url.value.trim();
-  if(!v) return false;
-  if(v.includes('.')||v.startsWith('http')){
-    return true;
-  }
-  location='/search?q='+encodeURIComponent(v);
-  return false;
-}
-</script>
-`);
+<br>
+<small>Tip: type a URL (e.g. google.com) or a search term</small>
+</body>
+</html>`);
 });
 
-// ─── MAIN PROXY ─────────────────────────────────────
+// ─── SMART GO HANDLER ───────────────────────────────────────────
+// Detects if input is URL or search term
+
+app.get('/go', (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q) return res.redirect('/');
+
+  // Looks like a URL?
+  if (/^https?:\/\//i.test(q) || /^[\w-]+\.\w{2,}(\/|$)/.test(q)) {
+    const target = /^https?:\/\//i.test(q) ? q : 'http://' + q;
+    return res.redirect(`/proxy?url=${encodeURIComponent(target)}`);
+  }
+
+  // Otherwise search
+  return res.redirect(`/search?q=${encodeURIComponent(q)}`);
+});
+
+// ─── MAIN PROXY ─────────────────────────────────────────────────
 
 app.get('/proxy', async (req, res) => {
-  let targetUrl = req.query.url;
+  let targetUrl = (req.query.url || '').trim();
   if (!targetUrl) return res.redirect('/');
 
   if (!/^https?:\/\//i.test(targetUrl)) {
@@ -176,15 +364,11 @@ app.get('/proxy', async (req, res) => {
   const proxyBase = `${req.protocol}://${req.get('host')}`;
 
   try {
-    const response = await axios.get(targetUrl, {
-      headers: { 'User-Agent': MODERN_UA },
-      responseType: 'arraybuffer',
-      maxRedirects: 0,
-      validateStatus: s => s < 400 || (s >= 300 && s < 400),
-    });
+    const response = await proxyFetch(targetUrl);
+    const status = response.status;
 
-    // Redirect fix
-    if (response.status >= 300 && response.headers.location) {
+    // Handle redirects — follow through proxy
+    if (status >= 300 && status < 400 && response.headers.location) {
       const redirectUrl = resolveUrl(targetUrl, response.headers.location);
       return res.redirect(`/proxy?url=${encodeURIComponent(redirectUrl)}`);
     }
@@ -193,22 +377,32 @@ app.get('/proxy', async (req, res) => {
 
     if (contentType.includes('text/html')) {
       const html = response.data.toString('utf-8');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.send(transformHTML(html, targetUrl, proxyBase));
+    } else if (contentType.includes('text/css')) {
+      const rawCss = response.data.toString('utf-8');
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+      res.send(transformCSS(rawCss, targetUrl, proxyBase));
+    } else if (contentType.includes('javascript')) {
+      const rawJs = response.data.toString('utf-8');
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.send(transformJS(rawJs, proxyBase));
     } else {
-      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Type', contentType || 'application/octet-stream');
       res.send(response.data);
     }
 
   } catch (err) {
-    res.send('Proxy error: ' + err.message);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<html><body><h3>Proxy error</h3><p>${err.message}</p><a href="/">Back</a></body></html>`);
   }
 });
 
-// ─── SEARCH ─────────────────────────────────────────
+// ─── SEARCH ─────────────────────────────────────────────────────
 
 app.get('/search', async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.send('No query');
+  const q = (req.query.q || '').trim();
+  if (!q) return res.redirect('/');
 
   const proxyBase = `${req.protocol}://${req.get('host')}`;
 
@@ -216,99 +410,227 @@ app.get('/search', async (req, res) => {
     const data = await fetchSearch(q);
     const results = (data.results || []).slice(0, 10);
 
-    let html = `<h3>Results for "${q}"</h3>`;
+    let html = `<!DOCTYPE html>
+<html><head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="viewport" content="width=400">
+<title>Search: ${q}</title>
+<style>
+body { font-family: sans-serif; padding: 8px; background: #f5f5f5; font-size: 13px; }
+h3 { color: #336; font-size: 14px; }
+.r { margin-bottom: 10px; padding: 6px; background: #fff; border: 1px solid #ccc; }
+.r a { color: #00c; font-size: 13px; }
+.r small { color: #080; display: block; font-size: 11px; word-break: break-all; }
+.r p { margin: 3px 0 0; color: #333; font-size: 12px; }
+form input { width: 75%; padding: 3px; }
+</style>
+</head><body>
+<form method="GET" action="/search">
+<input name="q" value="${q.replace(/"/g, '&quot;')}">
+<input type="submit" value="Search">
+</form>
+<h3>Results for &quot;${q}&quot;</h3>`;
 
-    results.forEach(r => {
-      html += `<p>
-        <a href="${proxyBase}/proxy?url=${encodeURIComponent(r.url)}">${r.title}</a><br>
-        ${r.content || ''}
-      </p>`;
-    });
+    if (results.length === 0) {
+      html += `<p>No results found.</p>`;
+    } else {
+      results.forEach(r => {
+        const title = (r.title || r.url || '').replace(/</g, '&lt;');
+        const snippet = (r.content || '').replace(/</g, '&lt;').substring(0, 200);
+        const proxied = `${proxyBase}/proxy?url=${encodeURIComponent(r.url)}`;
+        html += `<div class="r">
+<a href="${proxied}">${title}</a>
+<small>${r.url}</small>
+${snippet ? `<p>${snippet}</p>` : ''}
+</div>`;
+      });
+    }
 
+    html += `<br><a href="/">Home</a></body></html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
 
   } catch (e) {
-    res.send(`
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<html><body>
 <h3>Search failed</h3>
-<p>All search instances failed.</p>
+<p>${e.message}</p>
+<p>All search providers timed out. Try again or <a href="/proxy?url=${encodeURIComponent('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(q))}">search via DuckDuckGo Lite</a>.</p>
 <a href="/">Back</a>
-`);
+</body></html>`);
   }
 });
 
-// ─── ASK (fixes Brave /ask) ─────────────────────────
+// ─── /ask → /search (Brave and others use this path) ────────────
 
-app.get('/ask', async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.redirect('/');
-
-  return res.redirect(`/search?q=${encodeURIComponent(q)}`);
+app.get('/ask', (req, res) => {
+  const q = req.query.q || req.query.query || '';
+  res.redirect(`/search?q=${encodeURIComponent(q)}`);
 });
 
-// ─── CSS / JS / RESOURCE ────────────────────────────
+// ─── GET FORM HANDLER ────────────────────────────────────────────
+// Handles GET forms injected with __proxy_url hidden field.
+// Removes __proxy_url from query string and proxies the rest.
+
+app.get('/form-get', async (req, res) => {
+  const targetUrl = req.query.__proxy_url;
+  if (!targetUrl) return res.redirect('/');
+
+  // Build params without our injected field
+  const params = { ...req.query };
+  delete params.__proxy_url;
+
+  const proxyBase = `${req.protocol}://${req.get('host')}`;
+
+  // Build the full target URL with query params
+  try {
+    const u = new urlModule.URL(targetUrl);
+    for (const [k, v] of Object.entries(params)) {
+      u.searchParams.set(k, v);
+    }
+    return res.redirect(`/proxy?url=${encodeURIComponent(u.href)}`);
+  } catch {
+    const qs = new urlModule.URLSearchParams(params).toString();
+    const sep = targetUrl.includes('?') ? '&' : '?';
+    return res.redirect(`/proxy?url=${encodeURIComponent(targetUrl + (qs ? sep + qs : ''))}`);
+  }
+});
+
+// ─── POST FORM HANDLER ───────────────────────────────────────────
+
+app.use('/form-post', express.urlencoded({ extended: true }));
+app.use('/form-post', express.json());
+
+app.all('/form-post', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.redirect('/');
+
+  const proxyBase = `${req.protocol}://${req.get('host')}`;
+
+  try {
+    const response = await proxyFetch(targetUrl, {
+      method: req.method,
+      data: req.body,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    if (response.status >= 300 && response.status < 400 && response.headers.location) {
+      const redirectUrl = resolveUrl(targetUrl, response.headers.location);
+      return res.redirect(`/proxy?url=${encodeURIComponent(redirectUrl)}`);
+    }
+
+    const html = response.data.toString('utf-8');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(transformHTML(html, targetUrl, proxyBase));
+  } catch {
+    res.send('Form submission failed');
+  }
+});
+
+// ─── CSS ─────────────────────────────────────────────────────────
 
 app.get('/css', async (req, res) => {
+  const targetUrl = req.query.url;
+  const baseUrl = req.query.base || targetUrl;
+  const proxyBase = `${req.protocol}://${req.get('host')}`;
+
+  if (!targetUrl) return res.send('');
+
   try {
-    const r = await axios.get(req.query.url, { headers: { 'User-Agent': MODERN_UA } });
-    res.send(transformCSS(r.data, req.query.base, `${req.protocol}://${req.get('host')}`));
+    const r = await axios.get(targetUrl, {
+      headers: { 'User-Agent': MODERN_UA },
+      timeout: 10000,
+      validateStatus: () => true
+    });
+    res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    res.send(transformCSS(r.data, baseUrl, proxyBase));
   } catch {
-    res.send('');
+    res.send('/* css fetch failed */');
   }
 });
+
+// ─── JS ──────────────────────────────────────────────────────────
 
 app.get('/js', async (req, res) => {
-  try {
-    const r = await axios.get(req.query.url, { headers: { 'User-Agent': MODERN_UA } });
-    res.send(transformJS(r.data));
-  } catch {
-    res.send('');
-  }
-});
-
-app.get('/resource', async (req, res) => {
-  try {
-    const r = await axios.get(req.query.url, {
-      responseType: 'arraybuffer',
-      headers: { 'User-Agent': MODERN_UA }
-    });
-    res.setHeader('Content-Type', r.headers['content-type'] || 'application/octet-stream');
-    res.send(r.data);
-  } catch {
-    res.send('');
-  }
-});
-
-// ─── FORM FIX (IMPORTANT) ───────────────────────────
-
-app.use('/form', express.urlencoded({ extended: true }));
-
-app.all('/form', async (req, res) => {
   const targetUrl = req.query.url;
   const proxyBase = `${req.protocol}://${req.get('host')}`;
 
-  const params = { ...req.query };
-  delete params.url;
+  if (!targetUrl) return res.send('');
 
   try {
-    const r = await axios({
-      method: req.method,
-      url: targetUrl,
-      data: req.method === 'POST' ? req.body : undefined,
-      params: req.method === 'GET' ? params : undefined,
+    const r = await axios.get(targetUrl, {
       headers: { 'User-Agent': MODERN_UA },
-      responseType: 'arraybuffer'
+      timeout: 10000,
+      validateStatus: () => true
     });
-
-    const html = r.data.toString('utf-8');
-    res.send(transformHTML(html, targetUrl, proxyBase));
-
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.send(transformJS(r.data.toString(), proxyBase));
   } catch {
-    res.send('Form failed');
+    res.send('/* js fetch failed */');
   }
 });
 
-// ─── START ──────────────────────────────────────────
+// ─── RESOURCE (images, fonts, etc.) ─────────────────────────────
+
+app.get('/resource', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.end();
+
+  try {
+    const r = await axios.get(targetUrl, {
+      responseType: 'arraybuffer',
+      headers: { 'User-Agent': MODERN_UA },
+      timeout: 15000,
+      validateStatus: () => true
+    });
+    const ct = r.headers['content-type'] || 'application/octet-stream';
+    res.setHeader('Content-Type', ct);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(r.data);
+  } catch {
+    res.end();
+  }
+});
+
+// ─── CATCH-ALL: intercept any raw path not handled above ─────────
+//
+// This fixes the "Cannot GET /something" errors when a page redirects
+// to a path that isn't one of our proxy routes (e.g. Brave's /ask,
+// /search/query, etc.). We reconstruct the absolute URL from the
+// Referer header and redirect to our proxy.
+
+app.use((req, res, next) => {
+  // Only intercept GET-like requests for unknown paths
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+
+  const referer = req.headers.referer || '';
+  const proxyBase = `${req.protocol}://${req.get('host')}`;
+
+  // Try to recover the original site from the Referer
+  const match = referer.match(/[?&]url=([^&]+)/);
+  if (match) {
+    try {
+      const originUrl = decodeURIComponent(match[1]);
+      const origin = new urlModule.URL(originUrl);
+      // Build the absolute target from the original site's origin + the requested path
+      const targetUrl = `${origin.protocol}//${origin.host}${req.url}`;
+      return res.redirect(`/proxy?url=${encodeURIComponent(targetUrl)}`);
+    } catch {}
+  }
+
+  // No referer context — just show a friendly error
+  res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<html><body>
+<h3>404 - Path not found in proxy</h3>
+<p>Requested: <code>${req.url}</code></p>
+<p>This page was reached outside of a proxied session. <a href="/">Go Home</a></p>
+</body></html>`);
+});
+
+// ─── START ───────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log('3DS Proxy running on ' + PORT);
+  console.log(`3DS Proxy running on port ${PORT}`);
 });
