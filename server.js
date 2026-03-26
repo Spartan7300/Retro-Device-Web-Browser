@@ -12,7 +12,30 @@ const MODERN_UA =
   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/120.0.0.0 Safari/537.36';
 
-// ─── Helpers ─────────────────────────────────────────
+// ─── SEARCH INSTANCES (fallback system) ─────────────────────────
+
+const INSTANCES = [
+  'https://searx.be',
+  'https://searx.tiekoetter.com',
+  'https://search.bus-hit.me'
+];
+
+async function fetchSearch(q) {
+  for (const instance of INSTANCES) {
+    try {
+      const urlSearch = `${instance}/search?q=${encodeURIComponent(q)}&format=json`;
+      const r = await axios.get(urlSearch, {
+        headers: { 'User-Agent': MODERN_UA },
+        timeout: 6000
+      });
+
+      if (r.data && r.data.results) return r.data;
+    } catch {}
+  }
+  throw new Error('All search instances failed');
+}
+
+// ─── HELPERS ─────────────────────────────────────────
 
 function resolveUrl(base, relative) {
   try {
@@ -29,7 +52,7 @@ function resolveUrl(base, relative) {
   }
 }
 
-// ─── CSS ─────────────────────────────────────────────
+// ─── TRANSFORMS ─────────────────────────────────────
 
 function transformCSS(rawCss, baseUrl, proxyBase) {
   rawCss = rawCss.replace(/url\(['"]?([^'")]+)['"]?\)/g, (match, u) => {
@@ -38,30 +61,22 @@ function transformCSS(rawCss, baseUrl, proxyBase) {
     return `url('${proxyBase}/resource?url=${encodeURIComponent(abs)}')`;
   });
 
-  let parsed;
   try {
-    parsed = css.parse(rawCss, { silent: true });
+    return css.stringify(css.parse(rawCss, { silent: true }));
   } catch {
     return rawCss;
   }
-
-  return css.stringify(parsed);
 }
-
-// ─── JS ──────────────────────────────────────────────
 
 function transformJS(src) {
   try {
-    src = src
+    return src
       .replace(/\b(const|let)\b/g, 'var')
       .replace(/window\.location\s*=\s*['"][^'"]*unsupported[^'"]*['"]/gi, '// blocked');
-
-  } catch {}
-
-  return src;
+  } catch {
+    return src;
+  }
 }
-
-// ─── HTML ────────────────────────────────────────────
 
 function transformHTML(html, targetUrl, proxyBase) {
   const $ = cheerio.load(html, { decodeEntities: false });
@@ -69,32 +84,29 @@ function transformHTML(html, targetUrl, proxyBase) {
   $('meta[name="viewport"]').remove();
   $('meta[http-equiv="X-UA-Compatible"]').remove();
 
-  // Remove browser-block scripts
+  // Remove basic "unsupported browser" scripts
   $('script').each(function () {
     const content = $(this).html() || '';
-    if (
-      content.includes('unsupported browser') ||
-      content.includes('please upgrade')
-    ) {
+    if (content.includes('unsupported browser') || content.includes('please upgrade')) {
       $(this).remove();
     }
   });
 
-  // Inject base UI + polyfills
+  // Inject polyfills
   $('head').prepend(`
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="viewport" content="width=400">
 <script>
-navigator.userAgent = '${MODERN_UA}';
-window.chrome = {};
-window.CSS = {};
-window.navigator.webdriver = false;
-window.Promise = window.Promise || function(fn){this.then=function(){return this};this.catch=function(){return this}};
-window.fetch = window.fetch || function(){return new Promise(function(){})};
+navigator.userAgent='${MODERN_UA}';
+window.chrome={};
+window.CSS={};
+window.navigator.webdriver=false;
+window.Promise=window.Promise||function(fn){this.then=function(){return this};this.catch=function(){return this}};
+window.fetch=window.fetch||function(){return new Promise(function(){})};
 </script>
 `);
 
-  // Rewrite links
+  // Links → proxy
   $('a[href]').each(function () {
     const href = $(this).attr('href');
     if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
@@ -102,13 +114,13 @@ window.fetch = window.fetch || function(){return new Promise(function(){})};
     $(this).attr('href', `${proxyBase}/proxy?url=${encodeURIComponent(abs)}`);
   });
 
-  // Rewrite forms
+  // Forms → proxy
   $('form[action]').each(function () {
     const abs = resolveUrl(targetUrl, $(this).attr('action'));
     $(this).attr('action', `${proxyBase}/form?url=${encodeURIComponent(abs)}`);
   });
 
-  // Rewrite scripts
+  // Scripts
   $('script').each(function () {
     const src = $(this).attr('src');
     if (src) {
@@ -119,7 +131,7 @@ window.fetch = window.fetch || function(){return new Promise(function(){})};
     }
   });
 
-  // Rewrite CSS
+  // CSS
   $('link[rel="stylesheet"]').each(function () {
     const abs = resolveUrl(targetUrl, $(this).attr('href'));
     $(this).attr('href', `${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(targetUrl)}`);
@@ -128,12 +140,10 @@ window.fetch = window.fetch || function(){return new Promise(function(){})};
   return $.html();
 }
 
-// ─── Routes ──────────────────────────────────────────
+// ─── HOME ───────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.send(`
-<html>
-<body>
 <h2>3DS Proxy</h2>
 <form method="GET" action="/proxy" onsubmit="return go(this)">
 <input name="url" style="width:80%">
@@ -150,12 +160,10 @@ function go(f){
   return false;
 }
 </script>
-</body>
-</html>
 `);
 });
 
-// ─── MAIN PROXY ──────────────────────────────────────
+// ─── MAIN PROXY ─────────────────────────────────────
 
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
@@ -169,16 +177,13 @@ app.get('/proxy', async (req, res) => {
 
   try {
     const response = await axios.get(targetUrl, {
-      headers: {
-        'User-Agent': MODERN_UA,
-        'Accept': '*/*',
-      },
+      headers: { 'User-Agent': MODERN_UA },
       responseType: 'arraybuffer',
       maxRedirects: 0,
       validateStatus: s => s < 400 || (s >= 300 && s < 400),
     });
 
-    // Redirect handling
+    // Redirect fix
     if (response.status >= 300 && response.headers.location) {
       const redirectUrl = resolveUrl(targetUrl, response.headers.location);
       return res.redirect(`/proxy?url=${encodeURIComponent(redirectUrl)}`);
@@ -188,8 +193,7 @@ app.get('/proxy', async (req, res) => {
 
     if (contentType.includes('text/html')) {
       const html = response.data.toString('utf-8');
-      const out = transformHTML(html, targetUrl, proxyBase);
-      res.send(out);
+      res.send(transformHTML(html, targetUrl, proxyBase));
     } else {
       res.setHeader('Content-Type', contentType);
       res.send(response.data);
@@ -200,21 +204,17 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// ─── SEARCH ──────────────────────────────────────────
+// ─── SEARCH ─────────────────────────────────────────
 
 app.get('/search', async (req, res) => {
   const q = req.query.q;
   if (!q) return res.send('No query');
 
   const proxyBase = `${req.protocol}://${req.get('host')}`;
-  const urlSearch = `https://searx.be/search?q=${encodeURIComponent(q)}&format=json`;
 
   try {
-    const r = await axios.get(urlSearch, {
-      headers: { 'User-Agent': MODERN_UA }
-    });
-
-    const results = (r.data.results || []).slice(0, 10);
+    const data = await fetchSearch(q);
+    const results = (data.results || []).slice(0, 10);
 
     let html = `<h3>Results for "${q}"</h3>`;
 
@@ -228,11 +228,24 @@ app.get('/search', async (req, res) => {
     res.send(html);
 
   } catch (e) {
-    res.send('Search failed');
+    res.send(`
+<h3>Search failed</h3>
+<p>All search instances failed.</p>
+<a href="/">Back</a>
+`);
   }
 });
 
-// ─── CSS / JS / RESOURCE ─────────────────────────────
+// ─── ASK (fixes Brave /ask) ─────────────────────────
+
+app.get('/ask', async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.redirect('/');
+
+  return res.redirect(`/search?q=${encodeURIComponent(q)}`);
+});
+
+// ─── CSS / JS / RESOURCE ────────────────────────────
 
 app.get('/css', async (req, res) => {
   try {
@@ -265,7 +278,7 @@ app.get('/resource', async (req, res) => {
   }
 });
 
-// ─── FORM ───────────────────────────────────────────
+// ─── FORM FIX (IMPORTANT) ───────────────────────────
 
 app.use('/form', express.urlencoded({ extended: true }));
 
@@ -273,12 +286,15 @@ app.all('/form', async (req, res) => {
   const targetUrl = req.query.url;
   const proxyBase = `${req.protocol}://${req.get('host')}`;
 
+  const params = { ...req.query };
+  delete params.url;
+
   try {
     const r = await axios({
       method: req.method,
       url: targetUrl,
       data: req.method === 'POST' ? req.body : undefined,
-      params: req.method === 'GET' ? req.query : undefined,
+      params: req.method === 'GET' ? params : undefined,
       headers: { 'User-Agent': MODERN_UA },
       responseType: 'arraybuffer'
     });
@@ -286,11 +302,13 @@ app.all('/form', async (req, res) => {
     const html = r.data.toString('utf-8');
     res.send(transformHTML(html, targetUrl, proxyBase));
 
-  } catch (e) {
+  } catch {
     res.send('Form failed');
   }
 });
 
+// ─── START ──────────────────────────────────────────
+
 app.listen(PORT, () => {
-  console.log('Running on ' + PORT);
+  console.log('3DS Proxy running on ' + PORT);
 });
