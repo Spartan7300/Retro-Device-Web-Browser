@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=400">
+    <title>Retro Web Browser</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: "Courier New", Courier, monospace;
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 30px 12px;
+        }
+
+        .browser {
+            width: 100%;
+            max-width: 560px;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 22px;
+            color: #00e5ff;
+            letter-spacing: 2px;
+            margin-bottom: 6px;
+            text-shadow: 0 0 10px #00e5ff88;
+        }
+
+        .subtitle {
+            text-align: center;
+            font-size: 11px;
+            color: #556;
+            margin-bottom: 22px;
+            letter-spacing: 1px;
+        }
+
+        .search-row {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        #query {
+            flex: 1;
+            background: #0d0d1a;
+            border: 1px solid #00e5ff55;
+            color: #e0e0e0;
+            font-family: inherit;
+            font-size: 14px;
+            padding: 8px 10px;
+            border-radius: 3px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        #query:focus { border-color: #00e5ff; }
+        #query::placeholder { color: #445; }
+
+        button {
+            background: #00e5ff22;
+            border: 1px solid #00e5ff66;
+            color: #00e5ff;
+            font-family: inherit;
+            font-size: 13px;
+            padding: 8px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 0.15s;
+        }
+
+        button:hover { background: #00e5ff44; }
+        button:active { background: #00e5ff66; }
+
+        .hint {
+            font-size: 10px;
+            color: #445;
+            text-align: center;
+            margin-bottom: 20px;
+            letter-spacing: 0.5px;
+        }
+
+        /* ── Results ── */
+        #status {
+            font-size: 12px;
+            color: #00e5ff88;
+            min-height: 16px;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        #results { list-style: none; }
+
+        #results li {
+            border: 1px solid #00e5ff22;
+            border-radius: 3px;
+            margin-bottom: 8px;
+            background: #0d0d1a;
+            transition: border-color 0.15s;
+        }
+
+        #results li:hover { border-color: #00e5ff66; }
+
+        #results a {
+            display: block;
+            padding: 10px 12px;
+            text-decoration: none;
+            color: inherit;
+        }
+
+        .result-title {
+            color: #00e5ff;
+            font-size: 13px;
+            margin-bottom: 3px;
+            word-break: break-word;
+        }
+
+        .result-url {
+            color: #556;
+            font-size: 10px;
+            margin-bottom: 4px;
+            word-break: break-all;
+        }
+
+        .result-desc {
+            color: #aaa;
+            font-size: 11px;
+            line-height: 1.4;
+        }
+
+        .error {
+            color: #ff6b6b;
+            font-size: 12px;
+            text-align: center;
+            padding: 12px;
+            border: 1px solid #ff6b6b44;
+            border-radius: 3px;
+            background: #1a0d0d;
+        }
+
+        .spinner { animation: spin 1s linear infinite; display: inline-block; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+<div class="browser">
+    <h1>&#9881; RETRO BROWSER</h1>
+    <p class="subtitle">3DS-Compatible Web Proxy</p>
+
+    <div class="search-row">
+        <input type="text" id="query" placeholder="Search or enter a URL..." autocomplete="off" autofocus>
+        <button id="goBtn">Go</button>
+    </div>
+    <p class="hint">Type a search term or paste a full URL (https://...)</p>
+
+    <div id="status"></div>
+    <ul id="results"></ul>
+</div>
+
+<script>
+    var PROXY_BASE = "https://retro-device-web-browser.onrender.com";
+
+    // Public SearXNG instances — tried in order if one fails
+    var SEARX_INSTANCES = [
+        "https://searx.be",
+        "https://search.disroot.org",
+        "https://searxng.site"
+    ];
+
+    var queryInput = document.getElementById("query");
+    var goBtn = document.getElementById("goBtn");
+    var statusEl = document.getElementById("status");
+    var resultsList = document.getElementById("results");
+
+    function isUrl(str) {
+        str = str.trim();
+        if (/^https?:\/\//i.test(str)) return true;
+        // bare domain like example.com
+        if (/^[a-z0-9-]+\.[a-z]{2,}(\/|$)/i.test(str)) return true;
+        return false;
+    }
+
+    function setStatus(msg) {
+        statusEl.innerHTML = msg;
+    }
+
+    function clearResults() {
+        resultsList.innerHTML = "";
+    }
+
+    function showError(msg) {
+        clearResults();
+        setStatus("");
+        var li = document.createElement("li");
+        li.className = "error";
+        li.textContent = msg;
+        resultsList.appendChild(li);
+    }
+
+    function renderResults(items) {
+        clearResults();
+        if (!items || items.length === 0) {
+            showError("No results found. Try different search terms.");
+            return;
+        }
+        setStatus("Found " + items.length + " result" + (items.length !== 1 ? "s" : "") + " — tap to open through proxy");
+
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            var li = document.createElement("li");
+
+            var a = document.createElement("a");
+            a.href = PROXY_BASE + "/proxy?url=" + encodeURIComponent(item.url);
+
+            var titleDiv = document.createElement("div");
+            titleDiv.className = "result-title";
+            titleDiv.textContent = item.title || item.url;
+
+            var urlDiv = document.createElement("div");
+            urlDiv.className = "result-url";
+            urlDiv.textContent = item.url;
+
+            a.appendChild(titleDiv);
+            a.appendChild(urlDiv);
+
+            if (item.content) {
+                var descDiv = document.createElement("div");
+                descDiv.className = "result-desc";
+                descDiv.textContent = item.content;
+                a.appendChild(descDiv);
+            }
+
+            li.appendChild(a);
+            resultsList.appendChild(li);
+        }
+    }
+
+    function searchWith(instanceIndex, query) {
+        if (instanceIndex >= SEARX_INSTANCES.length) {
+            showError("All search engines failed. Check your connection or try a direct URL.");
+            return;
+        }
+
+        var base = SEARX_INSTANCES[instanceIndex];
+        var searchUrl = base + "/search?q=" + encodeURIComponent(query) + "&format=json&language=en";
+
+        // We route the search itself through the proxy backend to avoid
+        // CORS issues on old browsers — the backend fetches JSON and returns it
+        var proxiedSearch = PROXY_BASE + "/search?q=" + encodeURIComponent(query) + "&instance=" + encodeURIComponent(base);
+
+        setStatus('<span class="spinner">&#8635;</span> Searching...');
+
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", proxiedSearch, true);
+        xhr.timeout = 12000;
+
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== 4) return;
+            if (xhr.status === 200) {
+                try {
+                    var data = JSON.parse(xhr.responseText);
+                    renderResults(data.results || []);
+                } catch(e) {
+                    // Try next instance
+                    searchWith(instanceIndex + 1, query);
+                }
+            } else {
+                searchWith(instanceIndex + 1, query);
+            }
+        };
+
+        xhr.ontimeout = function() {
+            searchWith(instanceIndex + 1, query);
+        };
+
+        xhr.onerror = function() {
+            searchWith(instanceIndex + 1, query);
+        };
+
+        xhr.send();
+    }
+
+    function go() {
+        var raw = queryInput.value.trim();
+        if (!raw) return;
+
+        clearResults();
+
+        if (isUrl(raw)) {
+            // Direct URL — normalise and send straight to proxy
+            var target = /^https?:\/\//i.test(raw) ? raw : "https://" + raw;
+            window.location.href = PROXY_BASE + "/proxy?url=" + encodeURIComponent(target);
+        } else {
+            // Search query
+            searchWith(0, raw);
+        }
+    }
+
+    goBtn.addEventListener("click", go);
+
+    queryInput.addEventListener("keydown", function(e) {
+        if (e.keyCode === 13) go();
+    });
+</script>
+</body>
+</html>
