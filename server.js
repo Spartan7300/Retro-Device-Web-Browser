@@ -4,6 +4,10 @@ const cheerio = require('cheerio');
 const css = require('css');
 const urlModule = require('url');
 
+// Optional: ytdl-core for YouTube video streaming (npm install ytdl-core)
+let ytdl = null;
+try { ytdl = require('ytdl-core'); } catch(e) { console.warn('[proxy] ytdl-core not installed — YouTube download disabled'); }
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -631,7 +635,7 @@ function transformHTML(html, targetUrl, proxyBase) {
 
   $('head').prepend(
     `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">\n` +
-    `<meta name="viewport" content="width=400">\n` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0">\n` +
     buildShims(proxyBase, targetUrl)
   );
 
@@ -710,19 +714,86 @@ function transformHTML(html, targetUrl, proxyBase) {
   safeEach($, 'iframe[src]', function () {
     const src = $(this).attr('src');
     if (!src || src.startsWith('data:') || src.startsWith('javascript:')) return;
-    $(this).attr('src', proxyUrl(resolveUrl(targetUrl, src), proxyBase));
+    const abs = resolveUrl(targetUrl, src);
+
+    // Detect and replace known video embeds with a native <video> player
+    const ytMatch = abs.match(/(?:youtube\.com\/embed\/|youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+    const vmMatch = abs.match(/(?:vimeo\.com\/(?:video\/)?|player\.vimeo\.com\/video\/)(\d+)/);
+    const dmMatch = abs.match(/(?:dailymotion\.com\/(?:embed\/video\/|video\/)|dai\.ly\/)([A-Za-z0-9]+)/);
+
+    if (ytMatch) {
+      const vid = ytMatch[1];
+      $(this).replaceWith(`<div class="proxy-video-wrap"><video controls preload="none" poster="${proxyBase}/resource?url=${encodeURIComponent(`https://img.youtube.com/vi/${vid}/mqdefault.jpg`)}"><source src="${proxyBase}/video?id=${encodeURIComponent(vid)}&src=youtube" type="video/mp4"><p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${vid}`)}">Watch on YouTube: ${vid}</a></p></video></div>`);
+    } else if (vmMatch) {
+      const vid = vmMatch[1];
+      $(this).replaceWith(`<div class="proxy-video-wrap"><p style="color:#fff;padding:8px;font-size:12px;">Vimeo video (${vid})<br><a style="color:#8cf;" href="${proxyBase}/proxy?url=${encodeURIComponent(`https://vimeo.com/${vid}`)}">Open on Vimeo</a></p></div>`);
+    } else if (dmMatch) {
+      const vid = dmMatch[1];
+      $(this).replaceWith(`<div class="proxy-video-wrap"><video controls preload="none"><source src="${proxyBase}/video?id=${encodeURIComponent(vid)}&src=dailymotion" type="video/mp4"><p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.dailymotion.com/video/${vid}`)}">Watch on Dailymotion: ${vid}</a></p></video></div>`);
+    } else {
+      $(this).attr('src', proxyUrl(abs, proxyBase));
+    }
   });
 
-  // 3DS layout normalizer — appended after all page content
+  // Rewrite <video> sources
+  safeEach($, 'video', function () {
+    const src = $(this).attr('src');
+    if (src && !src.startsWith('data:')) {
+      const abs = resolveUrl(targetUrl, src);
+      $(this).attr('src', `${proxyBase}/video?url=${encodeURIComponent(abs)}`);
+    }
+    const poster = $(this).attr('poster');
+    if (poster && !poster.startsWith('data:')) {
+      $(this).attr('poster', `${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, poster))}`);
+    }
+    // Wrap in fluid container if not already
+    if (!$(this).parent().hasClass('proxy-video-wrap')) {
+      $(this).wrap('<div class="proxy-video-wrap"></div>');
+    }
+    // Add controls attribute
+    $(this).attr('controls', '');
+    $(this).attr('preload', 'none');
+  });
+
+  // Rewrite <source> inside <video>
+  safeEach($, 'video source[src]', function () {
+    const src = $(this).attr('src');
+    if (!src || src.startsWith('data:')) return;
+    $(this).attr('src', `${proxyBase}/video?url=${encodeURIComponent(resolveUrl(targetUrl, src))}`);
+  });
+
+  // Replace <object>/<embed> that look like video players
+  safeEach($, 'object[data]', function () {
+    const data = $(this).attr('data') || '';
+    const type = $(this).attr('type') || '';
+    if (/video|flash|swf/i.test(type + data)) {
+      $(this).replaceWith(`<div class="proxy-video-wrap" style="background:#222;"><p style="color:#aaa;padding:8px;font-size:11px;">Flash/object video not supported.<br><a style="color:#8cf;" href="${proxyBase}/proxy?url=${encodeURIComponent(resolveUrl(targetUrl, data))}">Try direct link</a></p></div>`);
+    }
+  });
+  safeEach($, 'embed[src]', function () {
+    const src = $(this).attr('src') || '';
+    const type = $(this).attr('type') || '';
+    if (/video|flash|swf/i.test(type + src)) {
+      $(this).replaceWith(`<div class="proxy-video-wrap" style="background:#222;"><p style="color:#aaa;padding:8px;font-size:11px;">Flash/embed video not supported.<br><a style="color:#8cf;" href="${proxyBase}/proxy?url=${encodeURIComponent(resolveUrl(targetUrl, src))}">Try direct link</a></p></div>`);
+    }
+  });
+
+  // Dynamic layout normalizer — fluid, works on 3DS (320px) and any wider device
   $('body').append(`<style>
 *{-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;}
-body{max-width:400px!important;overflow-x:hidden!important;margin:0 auto!important;word-wrap:break-word;}
-img,video,canvas,svg,object,embed{max-width:100%!important;height:auto!important;}
-table{max-width:100%!important;word-wrap:break-word;table-layout:fixed;}
+html,body{width:100%!important;max-width:100%!important;overflow-x:hidden!important;margin:0!important;padding:0!important;word-wrap:break-word;}
+body{padding:4px!important;}
+img,video,canvas,svg,object,embed{max-width:100%!important;height:auto!important;display:block;}
+table{width:100%!important;max-width:100%!important;word-wrap:break-word;table-layout:fixed;}
 td,th{word-wrap:break-word;overflow:hidden;}
 pre,code,kbd,samp{white-space:pre-wrap!important;word-wrap:break-word!important;max-width:100%!important;overflow-x:auto;}
 input,select,textarea,button{max-width:100%!important;}
 [style*="position:fixed"],[style*="position: fixed"]{position:absolute!important;}
+/* Fluid video container */
+.proxy-video-wrap{position:relative;width:100%;padding-bottom:56.25%;height:0;overflow:hidden;background:#000;margin:4px 0;}
+.proxy-video-wrap video,.proxy-video-wrap iframe{position:absolute;top:0;left:0;width:100%!important;height:100%!important;border:0;}
+/* Narrow-screen tweaks for 3DS (320px top screen) */
+@media screen and (max-width:340px){body{font-size:11px!important;}a{word-break:break-all;}}
 </style>`);
 
   return $.html();
@@ -755,14 +826,15 @@ app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-<meta name="viewport" content="width=400">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>3DS Proxy</title>
 <style>
-body{font-family:sans-serif;padding:10px;background:#dde;max-width:400px;}
+body{font-family:sans-serif;padding:10px;background:#dde;width:100%;max-width:600px;margin:0 auto;-webkit-box-sizing:border-box;box-sizing:border-box;}
 h2{color:#336;font-size:16px;}
 input[name=q]{width:72%;padding:4px;font-size:13px;}
 input[type=submit]{padding:4px 8px;font-size:13px;}
 small{color:#555;font-size:11px;}
+@media screen and (max-width:340px){input[name=q]{width:62%;font-size:12px;}}
 </style>
 </head><body>
 <h2>3DS Web Proxy</h2>
@@ -804,6 +876,9 @@ app.get('/proxy', async (req, res) => {
     } else if (ct.includes('javascript')) {
       res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
       res.send(transformJS(response.data.toString('utf-8'), proxyBase));
+    } else if (ct.includes('video/') || ct.includes('application/x-mpegurl') || ct.includes('application/vnd.apple.mpegurl')) {
+      // Redirect video streams through the video proxy for range-request support
+      res.redirect(`/video?url=${encodeURIComponent(targetUrl)}`);
     } else {
       res.setHeader('Content-Type', ct || 'application/octet-stream');
       res.send(response.data);
@@ -824,12 +899,14 @@ app.get('/search', async (req, res) => {
     const results = (data.results || []).slice(0, 10);
     let html = `<!DOCTYPE html><html><head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-<meta name="viewport" content="width=400">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Search: ${q}</title>
-<style>body{font-family:sans-serif;padding:8px;background:#f5f5f5;font-size:13px;max-width:400px;}
+<style>body{font-family:sans-serif;padding:8px;background:#f5f5f5;font-size:13px;width:100%;max-width:600px;margin:0 auto;-webkit-box-sizing:border-box;box-sizing:border-box;}
 h3{color:#336;font-size:13px;margin:4px 0;}.r{margin-bottom:8px;padding:5px;background:#fff;border:1px solid #ccc;}
 .r a{color:#00c;font-size:13px;}.r small{color:#080;display:block;font-size:10px;word-break:break-all;}
-.r p{margin:2px 0;color:#333;font-size:11px;}form{margin-bottom:6px;}input[name=q]{width:70%;font-size:12px;}</style>
+.r p{margin:2px 0;color:#333;font-size:11px;}form{margin-bottom:6px;}input[name=q]{width:70%;font-size:12px;}
+@media screen and (max-width:340px){input[name=q]{width:55%;}}
+</style>
 </head><body>
 <form method="GET" action="/search"><input name="q" value="${q.replace(/"/g,'&quot;')}"><input type="submit" value="Search"> | <a href="/">Home</a></form>
 <h3>Results for &quot;${q}&quot;</h3>`;
@@ -906,6 +983,92 @@ app.get('/js', async (req, res) => {
     res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
     res.send(transformJS(r.data.toString(), proxyBase));
   } catch { res.send('/* js fetch failed */'); }
+});
+
+// ─── VIDEO PROXY (240p target) ───────────────────────────────────
+// Supports: YouTube (ytdl-core), direct video URLs
+// Usage: /video?url=<direct_video_url>
+//        /video?id=<youtube_id>&src=youtube
+//        /video?id=<dailymotion_id>&src=dailymotion
+app.get('/video', async (req, res) => {
+  const directUrl = (req.query.url || '').trim();
+  const id        = (req.query.id  || '').trim();
+  const src       = (req.query.src || '').toLowerCase();
+
+  try {
+    // ── YouTube via ytdl-core ──────────────────────────────────
+    if ((src === 'youtube' || (!directUrl && !src)) && (id || req.query.ytid)) {
+      const ytId = id || req.query.ytid;
+      if (!ytdl) {
+        return res.status(503).send(`<html><body><p>YouTube video streaming requires <b>ytdl-core</b>.<br>Run: <code>npm install ytdl-core</code></p><a href="/">Back</a></body></html>`);
+      }
+      const videoUrl = `https://www.youtube.com/watch?v=${ytId}`;
+      // Choose lowest quality ≤ 240p for bandwidth savings
+      const info = await ytdl.getInfo(videoUrl);
+      // Prefer combined (video+audio) formats at or below 240p
+      const format = ytdl.chooseFormat(info.formats, {
+        quality: 'lowest',
+        filter: f =>
+          f.hasVideo && f.hasAudio &&
+          (f.qualityLabel === '240p' || f.qualityLabel === '144p' || f.quality === 'small')
+      }) || ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' });
+
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      ytdl(videoUrl, { format }).pipe(res);
+      return;
+    }
+
+    // ── Dailymotion: fetch manifest and return lowest stream ───
+    if (src === 'dailymotion' && id) {
+      const apiUrl = `https://www.dailymotion.com/player/metadata/video/${id}`;
+      const meta = await axios.get(apiUrl, { headers: { 'User-Agent': MODERN_UA }, timeout: 10000, validateStatus: () => true });
+      const qualities = meta.data && meta.data.qualities && meta.data.qualities.auto;
+      // Try to find 240p or lowest quality stream
+      let streamUrl = null;
+      if (meta.data && meta.data.qualities) {
+        const prios = ['240', '144', '380', 'auto'];
+        for (const p of prios) {
+          const bucket = meta.data.qualities[p];
+          if (bucket && bucket[0] && bucket[0].url) { streamUrl = bucket[0].url; break; }
+        }
+      }
+      if (!streamUrl) {
+        return res.status(404).send('<html><body><p>Dailymotion stream not found.</p><a href="/">Back</a></body></html>');
+      }
+      return res.redirect(streamUrl);
+    }
+
+    // ── Direct video URL proxy ─────────────────────────────────
+    if (directUrl) {
+      const range = req.headers['range'];
+      const headers = { 'User-Agent': MODERN_UA };
+      if (range) headers['Range'] = range;
+
+      const upstream = await axios.get(directUrl, {
+        responseType: 'stream',
+        headers,
+        timeout: 20000,
+        validateStatus: () => true,
+        maxRedirects: 5
+      });
+
+      const ct = upstream.headers['content-type'] || 'video/mp4';
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+      if (upstream.headers['content-range'])  res.setHeader('Content-Range',  upstream.headers['content-range']);
+      res.status(upstream.status === 206 ? 206 : 200);
+      upstream.data.pipe(res);
+      return;
+    }
+
+    res.status(400).send('<html><body><p>No video source specified.</p><a href="/">Back</a></body></html>');
+  } catch (err) {
+    res.status(500).setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<html><body><h3>Video error</h3><p>${err.message}</p><a href="/">Back</a></body></html>`);
+  }
 });
 
 // ─── RESOURCE ────────────────────────────────────────────────────
