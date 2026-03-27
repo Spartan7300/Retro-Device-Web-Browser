@@ -75,227 +75,449 @@ function proxyUrl(abs, proxyBase) {
   return `${proxyBase}/proxy?url=${encodeURIComponent(abs)}`;
 }
 
-// ─── CSS DOWNGRADE HELPERS ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// CSS TRANSFORMATION PIPELINE — 3DS WebKit (r534) compatibility
+// Strategy:
+//  1. Pre-process raw CSS text (variables, imports, url proxying)
+//  2. Parse AST and walk rules, downgrading each declaration
+//  3. Selector modernisation (pseudo-classes, :is/:where/:has etc.)
+//  4. Media query filtering (keep only width/height/print queries)
+//  5. Inject a polished base stylesheet that makes pages look good
+// ═══════════════════════════════════════════════════════════════════
 
-function downgradeCSSValue(prop, value) {
-  // rgba → rgb (drop alpha)
-  value = value.replace(/rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,[^)]+\)/gi,
-    (m, r, g, b) => `rgb(${r},${g},${b})`);
-  // hsla → hsl
-  value = value.replace(/hsla\(([^,]+,[^,]+,[^,]+),[^)]+\)/gi,
-    (m, inner) => `hsl(${inner})`);
-  // CSS variables → fallback or inherit
-  value = value.replace(/var\(--[\w-]+(?:\s*,\s*([^)]+))?\)/gi,
-    (m, fb) => fb ? fb.trim() : 'inherit');
-  // calc() — attempt simple same-unit collapse
-  value = value.replace(/calc\(([^)]+)\)/gi, (m, expr) => {
-    try {
-      const su = expr.match(/^([\d.]+)(px|em|rem|%)\s*([+\-])\s*([\d.]+)\2$/);
-      if (su) { const v = su[3]==='+' ? +su[1]+ +su[4] : +su[1]- +su[4]; return `${v}${su[2]}`; }
-      const pn = expr.match(/^([\d.]+)\s*([+\-\*\/])\s*([\d.]+)$/);
-      if (pn) { const a=+pn[1],op=pn[2],b=+pn[3]; return String(op==='+'?a+b:op==='-'?a-b:op==='*'?a*b:b?a/b:a); }
-    } catch {}
-    return m;
+// ── CSS variable registry ─────────────────────────────────────────
+// First-pass extraction of :root / html variable definitions
+// so we can substitute them with real values instead of "inherit".
+function extractCSSVars(rawCss) {
+  const vars = {};
+  const rootBlocks = rawCss.match(/(?::root|html)\s*\{([^}]*)\}/gi) || [];
+  for (const block of rootBlocks) {
+    const inner = block.replace(/^[^{]+\{/, '').replace(/\}$/, '');
+    const decls = inner.match(/--[\w-]+\s*:[^;]+/g) || [];
+    for (const d of decls) {
+      const colon = d.indexOf(':');
+      const name = d.slice(0, colon).trim();
+      const val  = d.slice(colon + 1).trim();
+      vars[name] = val;
+    }
+  }
+  return vars;
+}
+
+// Resolve a CSS variable reference, with circular-ref guard
+function resolveVar(name, vars, depth) {
+  if (depth > 8) return '';
+  const val = vars[name];
+  if (!val) return '';
+  return val.replace(/var\(\s*(--[\w-]+)(?:\s*,\s*([^)]+))?\)/g, (m, n, fb) => {
+    const resolved = resolveVar(n, vars, depth + 1);
+    return resolved || (fb ? fb.trim() : '');
   });
-  // clamp(min,val,max) → val
-  value = value.replace(/clamp\(\s*[^,]+,\s*([^,]+),\s*[^)]+\)/gi, (m, val) => val.trim());
-  // min(a,b) → a
-  value = value.replace(/\bmin\(\s*([^,)]+),[^)]+\)/gi, (m, a) => a.trim());
-  // max(a,b) → b
-  value = value.replace(/\bmax\([^,]+,\s*([^)]+)\)/gi, (m, b) => b.trim());
-  // gradients → first colour stop
-  value = value.replace(/(?:linear|radial|conic)-gradient\([^)]*?,\s*(#[\da-fA-F]{3,8}|rgba?[^,)]+|[a-zA-Z]+)[^)]*\)/gi,
-    (m, c) => c || '#ccc');
-  // env() → fallback or 0
-  value = value.replace(/env\(\s*[\w-]+(?:\s*,\s*([^)]+))?\)/gi, (m, fb) => fb ? fb.trim() : '0');
+}
+
+// ── Value downgrader ──────────────────────────────────────────────
+function downgradeCSSValue(prop, value, vars) {
+  if (!value) return value;
+
+  // CSS variables — resolve against registry first, fallback arg, then safe defaults
+  value = value.replace(/var\(\s*(--[\w-]+)(?:\s*,\s*([^)]+))?\)/gi, (m, name, fb) => {
+    const resolved = resolveVar(name, vars || {}, 0);
+    if (resolved) return resolved;
+    if (fb) return fb.trim();
+    if (/color|background/.test(prop)) return 'transparent';
+    if (/width|height|size|radius|gap|padding|margin|border/.test(prop)) return '0';
+    return '';
+  });
+
+  // rgba(r g b / a) modern space-syntax → rgb(r,g,b)
+  value = value.replace(/rgba?\(\s*(\d+)\s+(\d+)\s+(\d+)\s*(?:\/\s*[\d.%]+)?\s*\)/gi,
+    (m, r, g, b) => 'rgb(' + r + ',' + g + ',' + b + ')');
+  // rgba(r,g,b,a) → rgb(r,g,b)
+  value = value.replace(/rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,[^)]+\)/gi,
+    (m, r, g, b) => 'rgb(' + r + ',' + g + ',' + b + ')');
+  // hsl(h s% l%) modern syntax → hsl(h,s%,l%)
+  value = value.replace(/hsla?\(\s*([\d.]+)\s+([\d.]+%?)\s+([\d.]+%?)(?:\s*\/\s*[\d.%]+)?\s*\)/gi,
+    (m, h, s, l) => 'hsl(' + h + ',' + s + ',' + l + ')');
+  // hsla(h,s,l,a) → hsl(h,s,l)
+  value = value.replace(/hsla\(([^,]+,[^,]+,[^,]+),[^)]+\)/gi,
+    (m, inner) => 'hsl(' + inner + ')');
+
+  // calc() — evaluate where possible, safe fallback otherwise
+  value = value.replace(/calc\(([^)]+)\)/gi, function(m, expr) {
+    try {
+      var su = expr.match(/^([\d.]+)(px|em|rem|%)\s*([+\-])\s*([\d.]+)\2$/);
+      if (su) {
+        var v = su[3] === '+' ? +su[1] + +su[4] : +su[1] - +su[4];
+        return Math.max(0, v) + su[2];
+      }
+      var pn = expr.match(/^([\d.]+)\s*([+\-\*\/])\s*([\d.]+)$/);
+      if (pn) {
+        var a = +pn[1], op = pn[2], b = +pn[3];
+        return String(op==='+'?a+b : op==='-'?a-b : op==='*'?a*b : b ? +(a/b).toFixed(4) : a);
+      }
+      if (/^100%\s*-\s*[\d.]+px$/.test(expr)) return '95%';
+      if (/width|height|size/.test(prop)) return '100%';
+    } catch(e) {}
+    return 'auto';
+  });
+
+  // clamp(min, val, max) → val
+  value = value.replace(/clamp\(\s*[^,]+,\s*([^,]+),\s*[^)]+\)/gi, function(m, v) { return v.trim(); });
+  // min(a,b) → a  /  max(a,b) → b
+  value = value.replace(/\bmin\(\s*([^,)]+),[^)]+\)/gi, function(m, a) { return a.trim(); });
+  value = value.replace(/\bmax\([^,]+,\s*([^)]+)\)/gi, function(m, b) { return b.trim(); });
+
+  // Gradients → extract first usable colour stop
+  // We can't use [^)]* because stops may contain rgb()/hsl() with parens.
+  // Instead strip the outer function name+paren and grab colour tokens.
+  value = value.replace(/(?:linear|radial|conic)-gradient\s*\(/gi, function(m) {
+    return '__GRAD__(';
+  });
+  value = value.replace(/__GRAD__\(([^]*?)\)/g, function(m, inner) {
+    var stops = [];
+    var colRe = /(#[\da-fA-F]{3,8}|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)|hsl\(\s*[\d.]+\s*,\s*[\d.%]+\s*,\s*[\d.%]+\s*\)|[a-zA-Z]{3,20})/g;
+    var cm2;
+    var skip = /^(to|from|at|circle|ellipse|closest|farthest|cover|contain|top|bottom|left|right|center|transparent|none|deg|grad|rad|turn|px|em|rem|vh|vw)$/i;
+    while ((cm2 = colRe.exec(inner)) !== null) {
+      if (!skip.test(cm2[1]) && !/^\d/.test(cm2[1])) stops.push(cm2[1]);
+    }
+    return stops.length ? stops[0] : '#cccccc';
+  });
+
+  // env() → fallback or safe zero
+  value = value.replace(/env\(\s*[\w-]+(?:\s*,\s*([^)]+))?\)/gi, function(m, fb) { return fb ? fb.trim() : '0'; });
   // fit-content / min-content / max-content → auto
   value = value.replace(/fit-content\([^)]*\)/gi, 'auto');
   value = value.replace(/\b(?:min|max)-content\b/gi, 'auto');
-  // color() → #000
-  value = value.replace(/color\([^)]+\)/gi, '#000');
+  // color() lch() oklch() lab() → safe fallback
+  value = value.replace(/\b(?:ok)?(?:lch|lab|color)\([^)]+\)/gi, '#888888');
+  // light-dark() → first argument
+  value = value.replace(/light-dark\(\s*([^,)]+),[^)]+\)/gi, function(m, a) { return a.trim(); });
+
   return value;
 }
 
-function downgradeCSSProperty(decl) {
-  const prop = (decl.property || '').toLowerCase();
-  let val = downgradeCSSValue(prop, decl.value || '');
+// ── Property downgrader ───────────────────────────────────────────
+function downgradeCSSProperty(decl, vars) {
+  var prop = (decl.property || '').toLowerCase().trim();
+  var rawVal = decl.value || '';
+  var val = downgradeCSSValue(prop, rawVal, vars);
 
-  // display:grid → block
-  if (prop === 'display' && val.includes('grid')) return [{ type:'declaration', property:'display', value:'block' }];
-
-  // display:flex → -webkit-box + flex
-  if (prop === 'display' && (val === 'flex' || val === 'inline-flex')) {
-    return [
-      { type:'declaration', property:'display', value:'-webkit-box' },
-      { type:'declaration', property:'display', value:val }
-    ];
+  // ── display ───────────────────────────────────────────────────
+  if (prop === 'display') {
+    if (/\bgrid\b|\binline-grid\b/.test(val))
+      return [{ type:'declaration', property:'display', value:'block' }];
+    if (val === 'flex' || val === 'inline-flex') {
+      return [
+        { type:'declaration', property:'display', value:'-webkit-box' },
+        { type:'declaration', property:'display', value:'-webkit-flex' },
+        { type:'declaration', property:'display', value:val }
+      ];
+    }
+    if (val === 'contents')  return [];
+    if (val === 'flow-root' || val === 'run-in')
+      return [{ type:'declaration', property:'display', value:'block' }];
+    decl.value = val; return [decl];
   }
 
-  // Flexbox axis
+  // ── flex properties ───────────────────────────────────────────
   if (prop === 'flex-direction') {
-    const isCol = val.includes('column'), isRev = val.includes('reverse');
+    var isCol = val.indexOf('column') !== -1, isRev = val.indexOf('reverse') !== -1;
     return [
-      { type:'declaration', property:'-webkit-box-orient', value: isCol?'vertical':'horizontal' },
-      { type:'declaration', property:'-webkit-box-direction', value: isRev?'reverse':'normal' },
-      { type:'declaration', property:'flex-direction', value:val }
+      { type:'declaration', property:'-webkit-box-orient',     value: isCol ? 'vertical' : 'horizontal' },
+      { type:'declaration', property:'-webkit-box-direction',  value: isRev ? 'reverse' : 'normal' },
+      { type:'declaration', property:'-webkit-flex-direction', value: val },
+      { type:'declaration', property:'flex-direction',         value: val }
+    ];
+  }
+  if (prop === 'flex-wrap') {
+    return [
+      { type:'declaration', property:'-webkit-flex-wrap', value: val },
+      { type:'declaration', property:'flex-wrap',         value: val }
     ];
   }
   if (prop === 'align-items') {
-    const m = {center:'center','flex-start':'start','flex-end':'end',stretch:'stretch',baseline:'baseline'};
-    return [{ type:'declaration', property:'-webkit-box-align', value: m[val]||val },
-            { type:'declaration', property:'align-items', value:val }];
+    var wkAI = { center:'center', 'flex-start':'start', 'flex-end':'end', stretch:'stretch', baseline:'baseline' };
+    return [
+      { type:'declaration', property:'-webkit-box-align',   value: wkAI[val] || val },
+      { type:'declaration', property:'-webkit-align-items', value: val },
+      { type:'declaration', property:'align-items',          value: val }
+    ];
+  }
+  if (prop === 'align-content') {
+    return [
+      { type:'declaration', property:'-webkit-align-content', value: val },
+      { type:'declaration', property:'align-content',          value: val }
+    ];
+  }
+  if (prop === 'align-self') {
+    return [
+      { type:'declaration', property:'-webkit-align-self', value: val },
+      { type:'declaration', property:'align-self',          value: val }
+    ];
   }
   if (prop === 'justify-content') {
-    const m = {center:'center','flex-start':'start','flex-end':'end','space-between':'justify','space-around':'justify'};
-    return [{ type:'declaration', property:'-webkit-box-pack', value: m[val]||val },
-            { type:'declaration', property:'justify-content', value:val }];
+    var wkJC = { center:'center', 'flex-start':'start', 'flex-end':'end',
+      'space-between':'justify', 'space-around':'justify', 'space-evenly':'justify' };
+    return [
+      { type:'declaration', property:'-webkit-box-pack',        value: wkJC[val] || val },
+      { type:'declaration', property:'-webkit-justify-content', value: val },
+      { type:'declaration', property:'justify-content',          value: val }
+    ];
   }
   if (prop === 'flex' || prop === 'flex-grow') {
-    const n = parseFloat(val)||1;
-    return [{ type:'declaration', property:'-webkit-box-flex', value:String(n) },
-            { type:'declaration', property:prop, value:val }];
+    var fn = parseFloat(val) || 1;
+    return [
+      { type:'declaration', property:'-webkit-box-flex', value: String(fn) },
+      { type:'declaration', property:'-webkit-flex',     value: val },
+      { type:'declaration', property:prop,               value: val }
+    ];
+  }
+  if (prop === 'flex-shrink') {
+    return [
+      { type:'declaration', property:'-webkit-flex-shrink', value: val },
+      { type:'declaration', property:'flex-shrink',          value: val }
+    ];
+  }
+  if (prop === 'flex-basis') {
+    return [
+      { type:'declaration', property:'-webkit-flex-basis', value: val },
+      { type:'declaration', property:'flex-basis',          value: val }
+    ];
+  }
+  if (prop === 'flex-flow') {
+    return [
+      { type:'declaration', property:'-webkit-flex-flow', value: val },
+      { type:'declaration', property:'flex-flow',          value: val }
+    ];
   }
   if (prop === 'order') {
-    return [{ type:'declaration', property:'-webkit-box-ordinal-group', value:String((parseInt(val)||0)+1) },
-            { type:'declaration', property:'order', value:val }];
-  }
-
-  // webkit-prefix pairs
-  const wkPairs = [
-    'border-radius','border-top-left-radius','border-top-right-radius',
-    'border-bottom-left-radius','border-bottom-right-radius',
-    'box-shadow','transform','transform-origin','transform-style',
-    'transition','transition-property','transition-duration','transition-timing-function','transition-delay',
-    'animation','animation-name','animation-duration','animation-timing-function',
-    'animation-iteration-count','animation-fill-mode','animation-direction','animation-play-state','animation-delay',
-    'appearance','user-select','backface-visibility','filter',
-    'columns','column-count','column-gap','column-rule','column-span','column-width',
-    'text-size-adjust','font-smoothing','tap-highlight-color',
-  ];
-  if (wkPairs.includes(prop)) {
     return [
-      { type:'declaration', property:`-webkit-${prop}`, value:val },
-      { type:'declaration', property:prop, value:val }
+      { type:'declaration', property:'-webkit-box-ordinal-group', value: String((parseInt(val) || 0) + 1) },
+      { type:'declaration', property:'-webkit-order', value: val },
+      { type:'declaration', property:'order',          value: val }
     ];
   }
 
-  // position:sticky → -webkit-sticky + relative fallback
+  // ── gap → margin approximation ────────────────────────────────
+  if (prop === 'gap' || prop === 'grid-gap') {
+    var gparts = val.trim().split(/\s+/);
+    var gv = gparts[0];
+    return [{ type:'declaration', property:'margin-bottom', value: gv }];
+  }
+  if (prop === 'column-gap' || prop === 'grid-column-gap') {
+    return [{ type:'declaration', property:'margin-right', value: val }];
+  }
+  if (prop === 'row-gap' || prop === 'grid-row-gap') {
+    return [{ type:'declaration', property:'margin-bottom', value: val }];
+  }
+
+  // ── grid — attempt useful conversions, drop remainder ─────────
+  if (prop === 'grid-template-columns') {
+    return [
+      { type:'declaration', property:'display', value:'block' },
+      { type:'declaration', property:'width',   value:'100%' }
+    ];
+  }
+  if (prop.startsWith('grid-template') || prop.startsWith('grid-auto') ||
+      prop === 'grid-area' || prop === 'grid-column' || prop === 'grid-row' ||
+      prop === 'grid' || prop === 'grid-column-start' || prop === 'grid-column-end' ||
+      prop === 'grid-row-start' || prop === 'grid-row-end') {
+    return [];
+  }
+
+  // ── position:sticky ───────────────────────────────────────────
   if (prop === 'position' && val === 'sticky') {
     return [
       { type:'declaration', property:'position', value:'-webkit-sticky' },
-      { type:'declaration', property:'position', value:'relative' }
+      { type:'declaration', property:'position', value:'sticky' }
     ];
   }
   // overflow:overlay → auto
-  if (prop === 'overflow' && val === 'overlay') return [{ type:'declaration', property:'overflow', value:'auto' }];
-
-  // text-decoration shorthand — strip color/style extra tokens old webkit chokes on
-  if (prop === 'text-decoration') {
-    const first = val.split(/\s+/)[0];
-    if (['underline','overline','line-through','none'].includes(first)) {
-      return [{ type:'declaration', property:'text-decoration', value:first }];
-    }
+  if (prop === 'overflow' && val === 'overlay') {
+    return [{ type:'declaration', property:'overflow', value:'auto' }];
+  }
+  if ((prop === 'overflow-x' || prop === 'overflow-y') && val === 'clip') {
+    return [{ type:'declaration', property:prop, value:'hidden' }];
   }
 
-  // Drop properties 3DS WebKit cannot handle at all
-  const drop = [
-    'backdrop-filter','grid-template','grid-template-columns','grid-template-rows',
-    'grid-template-areas','grid-area','grid-column','grid-row','grid-auto-flow',
-    'grid-auto-columns','grid-auto-rows','gap','row-gap',
-    'contain','will-change','isolation','mix-blend-mode',
+  // ── text-decoration shorthand ─────────────────────────────────
+  if (prop === 'text-decoration') {
+    var tokens = val.split(/\s+/);
+    var kw = null;
+    for (var ti = 0; ti < tokens.length; ti++) {
+      if (['underline','overline','line-through','none'].indexOf(tokens[ti]) !== -1) { kw = tokens[ti]; break; }
+    }
+    if (kw) return [{ type:'declaration', property:'text-decoration', value: kw }];
+  }
+
+  // ── background — strip unsupported multi-layer syntax ─────────
+  if (prop === 'background' || prop === 'background-image') {
+    if (val.indexOf(',') !== -1 && !val.startsWith('url(') && !/^(#|rgb|hsl)/.test(val)) {
+      val = val.split(',')[0].trim();
+    }
+    decl.value = val; return [decl];
+  }
+
+  // ── font properties ───────────────────────────────────────────
+  if (prop === 'font-feature-settings' || prop === 'font-variation-settings' ||
+      prop === 'font-optical-sizing' || prop === 'font-kerning' ||
+      prop === 'font-display') return [];
+
+  // ── webkit-prefixed pairs ─────────────────────────────────────
+  var wkPairs = [
+    'border-radius','border-top-left-radius','border-top-right-radius',
+    'border-bottom-left-radius','border-bottom-right-radius',
+    'box-shadow',
+    'transform','transform-origin','transform-style',
+    'perspective','perspective-origin',
+    'transition','transition-property','transition-duration',
+    'transition-timing-function','transition-delay',
+    'animation','animation-name','animation-duration','animation-timing-function',
+    'animation-iteration-count','animation-fill-mode','animation-direction',
+    'animation-play-state','animation-delay',
+    'appearance','user-select','backface-visibility','filter',
+    'columns','column-count','column-rule','column-span','column-width',
+    'text-size-adjust','tap-highlight-color','overflow-scrolling','font-smoothing'
+  ];
+  if (wkPairs.indexOf(prop) !== -1) {
+    var out = [{ type:'declaration', property:'-webkit-' + prop, value: val }];
+    if (['appearance','user-select','columns','column-count','column-rule'].indexOf(prop) !== -1) {
+      out.push({ type:'declaration', property:'-moz-' + prop, value: val });
+    }
+    out.push({ type:'declaration', property:prop, value:val });
+    return out;
+  }
+
+  // ── Properties to drop entirely ───────────────────────────────
+  var dropSet = new Set([
+    'backdrop-filter',
+    'contain','will-change','isolation','mix-blend-mode','forced-color-adjust',
     'overscroll-behavior','overscroll-behavior-x','overscroll-behavior-y',
     'scroll-snap-type','scroll-snap-align','scroll-padding','scroll-margin',
-    'object-fit','object-position','font-display','font-variation-settings',
-    'font-feature-settings','font-kerning','font-optical-sizing',
+    'scroll-behavior',
+    'object-fit','object-position',
     'font-variant-ligatures','font-variant-numeric','font-variant-caps',
+    'font-variant-east-asian','font-variant-alternates',
     'text-decoration-color','text-decoration-style','text-decoration-thickness',
     'text-underline-offset','text-overflow-mode',
-    'paint-order','shape-outside','shape-margin',
-    'counter-set','list-style-type',  // keep list-style-type? actually fine, leave it
-  ];
-  // Re-allow list-style-type
-  const dropSet = new Set(drop.filter(d => d !== 'list-style-type'));
+    'paint-order','shape-outside','shape-margin','shape-image-threshold',
+    'counter-set','content-visibility','aspect-ratio',
+    'caret-color','accent-color',
+    'offset-path','offset-distance','offset-rotate',
+    'mask','mask-image','mask-size','mask-position','mask-repeat','mask-clip','mask-composite',
+    'clip-path',
+    'writing-mode','text-orientation','text-combine-upright',
+    'ruby-position','ruby-align',
+    'hyphenate-character','overflow-anchor','touch-action'
+  ]);
   if (dropSet.has(prop)) return [];
-
-  // grid-* wildcard
-  if (prop.startsWith('grid-')) return [];
 
   decl.value = val;
   return [decl];
 }
 
-function processRules(rules) {
+// ── Selector moderniser ───────────────────────────────────────────
+function downgradeSelector(s) {
+  s = s.replace(/:root\b/g, 'html');
+  s = s.replace(/:is\(([^)]+)\)/g, function(m, a) { return a.split(',')[0].trim(); });
+  s = s.replace(/:where\(([^)]+)\)/g, function(m, a) { return a.split(',')[0].trim(); });
+  if (s.indexOf(':has(') !== -1) return null;
+  s = s.replace(/:not\(([^)]+)\)/g, function(m, inner) {
+    return /^[a-zA-Z0-9.#*[\]="'_-]+$/.test(inner.trim()) ? ':not(' + inner.trim() + ')' : '';
+  });
+  s = s.replace(/:focus-visible\b/g, ':focus');
+  s = s.replace(/:focus-within\b/g, ':focus');
+  s = s.replace(/:any-link\b/g, ':link');
+  s = s.replace(/:placeholder-shown\b/g, ':focus');
+  s = s.replace(/:user-valid\b/g, ':valid');
+  s = s.replace(/:user-invalid\b/g, ':invalid');
+  s = s.replace(/::before\b/g, ':before');
+  s = s.replace(/::after\b/g, ':after');
+  s = s.replace(/::first-line\b/g, ':first-line');
+  s = s.replace(/::first-letter\b/g, ':first-letter');
+  s = s.replace(/::selection\b/g, '::-webkit-selection');
+  s = s.replace(/::placeholder\b/g, '::-webkit-input-placeholder');
+  s = s.replace(/::marker\b/g, ':before');
+  s = s.replace(/::backdrop\b/g, '');
+  s = s.replace(/^&\s*/, '');
+  return s.trim() || null;
+}
+
+// ── Rule processor ─────────────────────────────────────────────────
+function processRules(rules, vars) {
   if (!rules) return [];
-  const out = [];
-  for (const rule of rules) {
+  var out = [];
+  for (var ri = 0; ri < rules.length; ri++) {
+    var rule = rules[ri];
     if (!rule) continue;
 
     if (rule.type === 'rule') {
-      if (rule.selectors) {
-        rule.selectors = rule.selectors.map(s => {
-          s = s.replace(/:root\b/g, 'html');
-          s = s.replace(/:is\(([^)]+)\)/g, (m, a) => a.split(',')[0].trim());
-          s = s.replace(/:where\(([^)]+)\)/g, (m, a) => a.split(',')[0].trim());
-          if (s.includes(':has(')) return null;
-          s = s.replace(/:not\(([^)]+)\)/g, (m, inner) =>
-            /^[a-zA-Z.#*[\]="'-]+$/.test(inner) ? `:not(${inner})` : '');
-          s = s.replace(/:focus-visible\b/g, ':focus');
-          s = s.replace(/:focus-within\b/g, ':focus');
-          s = s.replace(/::before\b/g, ':before');
-          s = s.replace(/::after\b/g, ':after');
-          s = s.replace(/::first-line\b/g, ':first-line');
-          s = s.replace(/::first-letter\b/g, ':first-letter');
-          s = s.replace(/::selection\b/g, '::-webkit-selection');
-          s = s.replace(/::placeholder\b/g, '::-webkit-input-placeholder');
-          s = s.replace(/::placeholder-shown\b/g, '');
-          s = s.replace(/^&\s*/, '');
-          return s.trim() || null;
-        }).filter(Boolean);
-        if (!rule.selectors.length) continue;
-      }
-      const newDecls = [];
-      for (const d of (rule.declarations || [])) {
+      var selectors = (rule.selectors || []).map(downgradeSelector).filter(Boolean);
+      if (!selectors.length) continue;
+      rule.selectors = selectors;
+
+      var newDecls = [];
+      for (var di = 0; di < (rule.declarations || []).length; di++) {
+        var d = rule.declarations[di];
         if (!d || d.type !== 'declaration') { newDecls.push(d); continue; }
-        for (const nd of downgradeCSSProperty(d)) newDecls.push(nd);
+        var nds = downgradeCSSProperty(d, vars);
+        for (var ni = 0; ni < nds.length; ni++) newDecls.push(nds[ni]);
       }
       rule.declarations = newDecls;
+      if (!newDecls.length) continue;
       out.push(rule);
 
     } else if (rule.type === 'keyframes') {
       if (rule.keyframes) {
-        for (const kf of rule.keyframes) {
-          const nd = [];
-          for (const d of (kf.declarations || [])) {
-            if (!d || d.type !== 'declaration') { nd.push(d); continue; }
-            for (const x of downgradeCSSProperty(d)) nd.push(x);
+        for (var ki = 0; ki < rule.keyframes.length; ki++) {
+          var kf = rule.keyframes[ki];
+          var nd = [];
+          for (var kdi = 0; kdi < (kf.declarations || []).length; kdi++) {
+            var kd = kf.declarations[kdi];
+            if (!kd || kd.type !== 'declaration') { nd.push(kd); continue; }
+            var knds = downgradeCSSProperty(kd, vars);
+            for (var kni = 0; kni < knds.length; kni++) nd.push(knds[kni]);
           }
           kf.declarations = nd;
         }
       }
-      out.push({ type:'keyframes', name:rule.name, vendor:'-webkit-', keyframes:rule.keyframes });
+      out.push({ type:'keyframes', name: rule.name, vendor: '-webkit-', keyframes: rule.keyframes });
       out.push(rule);
 
     } else if (rule.type === 'media') {
-      const mq = (rule.media || '').toLowerCase();
-      if (/prefers-color-scheme|prefers-reduced-motion|hover|pointer|display-mode|prefers-contrast|forced-colors/.test(mq)) continue;
-      rule.media = rule.media.replace(/([\d.]+)rem/g, (m, n) => `${Math.round(parseFloat(n)*16)}px`);
-      rule.rules = processRules(rule.rules);
+      var mq = (rule.media || '').toLowerCase();
+      if (/prefers-color-scheme|prefers-reduced-motion|prefers-contrast|forced-colors|display-mode|hover|pointer/.test(mq)) continue;
+      rule.media = rule.media.replace(/([\d.]+)rem/g, function(m, n) { return Math.round(parseFloat(n) * 16) + 'px'; });
+      var innerRules = processRules(rule.rules, vars);
+      if (!innerRules.length) continue;
+      rule.rules = innerRules;
       out.push(rule);
 
     } else if (rule.type === 'supports') {
-      // Flatten @supports — just emit the inner rules unconditionally
-      for (const r of processRules(rule.rules)) out.push(r);
+      var suppRules = processRules(rule.rules, vars);
+      for (var si = 0; si < suppRules.length; si++) out.push(suppRules[si]);
 
     } else if (rule.type === 'font-face') {
-      const nd = [];
-      for (const d of (rule.declarations || [])) {
-        if (!d || d.type !== 'declaration') { nd.push(d); continue; }
-        if (['font-display','font-variation-settings'].includes(d.property)) continue;
-        nd.push(d);
+      var fnd = [];
+      for (var fdi = 0; fdi < (rule.declarations || []).length; fdi++) {
+        var fd = rule.declarations[fdi];
+        if (!fd || fd.type !== 'declaration') { fnd.push(fd); continue; }
+        if (['font-display','font-variation-settings','font-feature-settings',
+             'font-named-instance','unicode-range'].indexOf(fd.property) !== -1) continue;
+        fnd.push(fd);
       }
-      rule.declarations = nd;
+      rule.declarations = fnd;
       out.push(rule);
 
+    } else if (rule.type === 'charset') {
+      out.push(rule);
+
+    } else if (rule.type === 'layer' || rule.type === 'scope') {
+      if (rule.rules) {
+        var lr = processRules(rule.rules, vars);
+        for (var li = 0; li < lr.length; li++) out.push(lr[li]);
+      }
     } else {
       out.push(rule);
     }
@@ -303,30 +525,48 @@ function processRules(rules) {
   return out;
 }
 
+// ── Main CSS transform ─────────────────────────────────────────────
 function transformCSS(rawCss, baseUrl, proxyBase) {
-  // Proxy url() references
-  rawCss = rawCss.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
-    u = u.trim();
-    if (u.startsWith('data:') || u.startsWith('#')) return match;
-    return `url('${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(baseUrl, u))}')`;
-  });
+  if (!rawCss) return '';
+
+  // Extract CSS variables for substitution
+  var vars = extractCSSVars(rawCss);
+
   // Proxy @import
-  rawCss = rawCss.replace(/@import\s+['"]([^'"]+)['"]/g, (m, u) => {
+  rawCss = rawCss.replace(/@import\s+url\(\s*['"]?([^'")]+)['"]?\s*\)/g, function(m, u) {
     if (u.startsWith('data:')) return m;
-    const abs = resolveUrl(baseUrl, u);
-    return `@import '${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}'`;
+    var abs = resolveUrl(baseUrl, u);
+    return "@import url('" + proxyBase + "/css?url=" + encodeURIComponent(abs) + "&base=" + encodeURIComponent(abs) + "')";
   });
-  rawCss = rawCss.replace(/@import\s+url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (m, u) => {
+  rawCss = rawCss.replace(/@import\s+['"]([^'"]+)['"]/g, function(m, u) {
     if (u.startsWith('data:')) return m;
-    const abs = resolveUrl(baseUrl, u);
-    return `@import url('${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}')`;
+    var abs = resolveUrl(baseUrl, u);
+    return "@import '" + proxyBase + "/css?url=" + encodeURIComponent(abs) + "&base=" + encodeURIComponent(abs) + "'";
   });
+
+  // Proxy url() image/font references
+  rawCss = rawCss.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, function(match, u) {
+    u = u.trim();
+    if (u.startsWith('data:') || u.startsWith('#') || u.startsWith('about:')) return match;
+    var abs = resolveUrl(baseUrl, u);
+    if (!abs || abs.startsWith('data:')) return match;
+    return "url('" + proxyBase + "/resource?url=" + encodeURIComponent(abs) + "')";
+  });
+
+  // Strip bare @layer declarations
+  rawCss = rawCss.replace(/@layer\s+[\w.,\s]+;/g, '');
+
   try {
-    const ast = css.parse(rawCss, { silent: true });
-    if (ast && ast.stylesheet) ast.stylesheet.rules = processRules(ast.stylesheet.rules);
+    var ast = css.parse(rawCss, { silent: true });
+    if (ast && ast.stylesheet) {
+      ast.stylesheet.rules = processRules(ast.stylesheet.rules, vars);
+    }
     return css.stringify(ast, { compress: false });
-  } catch { return rawCss; }
+  } catch (e) {
+    return rawCss;
+  }
 }
+
 
 // ─── JS TRANSFORM ───────────────────────────────────────────────
 function transformJS(src, proxyBase) {
@@ -674,37 +914,161 @@ function transformHTML(html, targetUrl, proxyBase) {
     $(this).attr('href', `${proxyBase}/css?url=${encodeURIComponent(abs)}&base=${encodeURIComponent(abs)}`);
   });
 
+  // ── Inline <style> tags — transform through the CSS pipeline ──
+  // This is critical: many modern sites embed all their CSS variables
+  // and critical layout rules in inline <style> blocks.
+  safeEach($, 'style', function () {
+    const raw = $(this).html() || '';
+    if (!raw.trim()) return;
+    try {
+      $(this).html(transformCSS(raw, targetUrl, proxyBase));
+    } catch(e) { /* leave untransformed if it explodes */ }
+  });
+
+  // ── Remove elements that break old WebKit ─────────────────────
+  // <link rel="preload"> / <link rel="modulepreload"> — causes errors
+  $('link[rel="preload"], link[rel="modulepreload"], link[rel="prefetch"]').remove();
+  // <link rel="manifest"> — not needed
+  $('link[rel="manifest"]').remove();
+  // <script type="module"> — old WebKit can't run ES modules at all
+  // Convert to a no-op comment so dependent code doesn't throw reference errors
+  safeEach($, 'script[type="module"]', function () {
+    $(this).removeAttr('type').html('/* module script removed for 3DS compat */');
+  });
+  // Remove importmap — irrelevant without module support
+  $('script[type="importmap"]').remove();
+
+  // ── <picture> element — collapse to best <source> or <img> ───
+  // 3DS WebKit has no <picture> support; pick the first non-webp/avif
+  // source, or fall back to the <img> src inside it.
+  safeEach($, 'picture', function () {
+    const pic = $(this);
+    let chosenSrc = null;
+    // Try sources in order, skip modern formats the 3DS can't decode
+    pic.find('source').each(function () {
+      if (chosenSrc) return;
+      const type = ($(this).attr('type') || '').toLowerCase();
+      if (/avif|webp|jxl/.test(type)) return; // skip unsupported formats
+      const srcset = $(this).attr('srcset') || $(this).attr('src') || '';
+      if (srcset) {
+        // Pick the first URL from srcset (lowest descriptor usually comes first)
+        const firstUrl = srcset.trim().split(/,\s*/)[0].trim().split(/\s+/)[0];
+        if (firstUrl) chosenSrc = firstUrl;
+      }
+    });
+    // Fall back to <img src> inside the picture
+    const img = pic.find('img');
+    if (!chosenSrc) {
+      chosenSrc = img.attr('src') || img.attr('data-src') || '';
+    }
+    if (chosenSrc && !chosenSrc.startsWith('data:')) {
+      const abs = resolveUrl(targetUrl, chosenSrc);
+      // Replace the whole <picture> with a plain proxied <img>
+      const alt = img.attr('alt') || '';
+      const cls = img.attr('class') || '';
+      const style = img.attr('style') || '';
+      pic.replaceWith(
+        `<img src="${proxyBase}/resource?url=${encodeURIComponent(abs)}"` +
+        (alt   ? ` alt="${alt.replace(/"/g,'&quot;')}"` : '') +
+        (cls   ? ` class="${cls.replace(/"/g,'&quot;')}"` : '') +
+        (style ? ` style="${style.replace(/"/g,'&quot;')}"` : '') +
+        ` style="max-width:100%;height:auto;">`
+      );
+    } else {
+      // No usable source found — just unwrap to the <img>
+      pic.replaceWith(img);
+    }
+  });
+
+  // ── Lazy-loading normalization ────────────────────────────────
+  // 3DS WebKit has no native lazy loading. Move data-src/data-lazy etc.
+  // to src so images actually appear.
+  safeEach($, 'img[data-src]', function () {
+    const lazy = $(this).attr('data-src');
+    if (lazy && !lazy.startsWith('data:') && !($(this).attr('src') || '').match(/^https?:/)) {
+      $(this).attr('src', resolveUrl(targetUrl, lazy));
+    }
+    $(this).removeAttr('data-src');
+  });
+  safeEach($, 'img[data-lazy-src]', function () {
+    const lazy = $(this).attr('data-lazy-src');
+    if (lazy && !lazy.startsWith('data:') && !($(this).attr('src') || '').match(/^https?:/)) {
+      $(this).attr('src', resolveUrl(targetUrl, lazy));
+    }
+    $(this).removeAttr('data-lazy-src');
+  });
+  safeEach($, 'img[data-original]', function () {
+    const lazy = $(this).attr('data-original');
+    if (lazy && !lazy.startsWith('data:') && !($(this).attr('src') || '').match(/^https?:/)) {
+      $(this).attr('src', resolveUrl(targetUrl, lazy));
+    }
+    $(this).removeAttr('data-original');
+  });
+  // Remove loading="lazy" — not supported, might interfere
+  $('[loading]').removeAttr('loading');
+  // Remove decoding="async" — not supported
+  $('[decoding]').removeAttr('decoding');
+  // Remove fetchpriority — not supported
+  $('[fetchpriority]').removeAttr('fetchpriority');
+
   safeEach($, '[style]', function () {
-    const style = $(this).attr('style') || '';
-    const rw = style
-      .replace(/var\(--[\w-]+(?:\s*,\s*([^)]+))?\)/gi, (m, fb) => fb ? fb.trim() : 'inherit')
-      .replace(/rgba\((\d+),\s*(\d+),\s*(\d+),[^)]+\)/gi, 'rgb($1,$2,$3)')
-      .replace(/calc\([^)]+\)/gi, 'auto')
-      .replace(/clamp\([^)]+\)/gi, 'auto')
-      .replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, (match, u) => {
-        if (u.startsWith('data:') || u.startsWith('#')) return match;
-        return `url('${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, u))}')`;
+    var style = $(this).attr('style') || '';
+    // Parse inline style into declarations and run each through the downgrader
+    var outDecls = [];
+    var declParts = style.split(';');
+    for (var dpi = 0; dpi < declParts.length; dpi++) {
+      var part = declParts[dpi].trim();
+      if (!part) continue;
+      var colon = part.indexOf(':');
+      if (colon < 0) continue;
+      var iprop = part.slice(0, colon).trim().toLowerCase();
+      var ival  = part.slice(colon + 1).trim();
+      // Proxy url() inside value
+      ival = ival.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g, function(match, u) {
+        if (u.startsWith('data:') || u.startsWith('#') || u.startsWith('about:')) return match;
+        return "url('" + proxyBase + "/resource?url=" + encodeURIComponent(resolveUrl(targetUrl, u)) + "')";
       });
-    $(this).attr('style', rw);
+      var fakeDecl = { type:'declaration', property: iprop, value: ival };
+      try {
+        var results = downgradeCSSProperty(fakeDecl, {});
+        for (var ri2 = 0; ri2 < results.length; ri2++) {
+          var r2 = results[ri2];
+          if (r2 && r2.property && r2.value) outDecls.push(r2.property + ':' + r2.value);
+        }
+      } catch(e) {
+        outDecls.push(iprop + ':' + ival);
+      }
+    }
+    $(this).attr('style', outDecls.join(';'));
   });
 
   const srcAttrs = [
-    ['img', 'src'], ['img', 'data-src'], ['img', 'data-lazy-src'],
+    ['img', 'src'],
+    ['img', 'srcset'],
     ['source', 'src'], ['source', 'srcset'],
     ['video', 'src'], ['video', 'poster'],
     ['audio', 'src'], ['track', 'src'],
-    ['input[type="image"]', 'src']
+    ['input[type="image"]', 'src'],
+    ['link[rel="icon"]', 'href'], ['link[rel="shortcut icon"]', 'href'],
+    ['link[rel="apple-touch-icon"]', 'href'],
   ];
   for (const [sel, attr] of srcAttrs) {
     safeEach($, sel, function () {
       const val = $(this).attr(attr);
-      if (!val || val.startsWith('data:')) return;
+      if (!val || val.startsWith('data:') || val.startsWith(proxyBase)) return;
       if (attr === 'srcset') {
+        // srcset="url 1x, url 2x" — proxy each URL, keep descriptors
         const rw = val.split(',').map(part => {
-          const [u, ...rest] = part.trim().split(/\s+/);
+          const pieces = part.trim().split(/\s+/);
+          const u = pieces[0];
+          const rest = pieces.slice(1);
+          if (!u || u.startsWith('data:')) return part;
           return [`${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, u))}`, ...rest].join(' ');
         }).join(', ');
         $(this).attr(attr, rw);
+      } else if (attr === 'href') {
+        // favicon/touch-icon hrefs — proxy as resource
+        $(this).attr(attr, `${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, val))}`);
       } else {
         $(this).attr(attr, `${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, val))}`);
       }
@@ -778,22 +1142,144 @@ function transformHTML(html, targetUrl, proxyBase) {
     }
   });
 
-  // Dynamic layout normalizer — fluid, works on 3DS (320px) and any wider device
+  // Polished recovery stylesheet — injected LAST so it wins specificity battles.
+  // Goals: fix broken grid/flex layouts, ensure readable typography, make links
+  // and buttons look like interactive elements, not just blue text.
   $('body').append(`<style>
+/* ── Box model reset ───────────────────────────────────────── */
 *{-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;}
-html,body{width:100%!important;max-width:100%!important;overflow-x:hidden!important;margin:0!important;padding:0!important;word-wrap:break-word;}
-body{padding:4px!important;}
-img,video,canvas,svg,object,embed{max-width:100%!important;height:auto!important;display:block;}
-table{width:100%!important;max-width:100%!important;word-wrap:break-word;table-layout:fixed;}
-td,th{word-wrap:break-word;overflow:hidden;}
-pre,code,kbd,samp{white-space:pre-wrap!important;word-wrap:break-word!important;max-width:100%!important;overflow-x:auto;}
-input,select,textarea,button{max-width:100%!important;}
+html,body{width:100%!important;max-width:100%!important;overflow-x:hidden!important;
+  margin:0!important;padding:0!important;word-wrap:break-word;word-break:break-word;}
+body{padding:6px!important;line-height:1.5;}
+
+/* ── Typography baseline ───────────────────────────────────── */
+body,input,select,textarea,button{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;}
+h1{font-size:20px;margin:10px 0 6px;}
+h2{font-size:17px;margin:9px 0 5px;}
+h3{font-size:15px;margin:8px 0 4px;}
+h4,h5,h6{font-size:13px;margin:6px 0 3px;}
+h1,h2,h3,h4,h5,h6{line-height:1.3;font-weight:bold;}
+p{margin:6px 0;}
+
+/* ── Links ─────────────────────────────────────────────────── */
+a{color:#0055cc;text-decoration:underline;}
+a:visited{color:#551a8b;}
+a:hover,a:focus{color:#0033aa;text-decoration:underline;}
+
+/* ── Images & media ────────────────────────────────────────── */
+img,video,canvas,svg,object,embed{max-width:100%!important;height:auto!important;display:inline-block;}
+img{vertical-align:middle;}
+figure{margin:6px 0;}
+figcaption{font-size:11px;color:#555;margin-top:2px;}
+
+/* ── Tables ────────────────────────────────────────────────── */
+table{width:100%!important;max-width:100%!important;border-collapse:collapse;
+  word-wrap:break-word;table-layout:fixed;margin:6px 0;}
+td,th{word-wrap:break-word;overflow:hidden;padding:4px 5px;
+  border:1px solid #ddd;vertical-align:top;text-align:left;}
+th{background:#f0f0f0;font-weight:bold;}
+tr:nth-child(even) td{background:#f9f9f9;}
+
+/* ── Code & pre ────────────────────────────────────────────── */
+pre,code,kbd,samp{white-space:pre-wrap!important;word-wrap:break-word!important;
+  max-width:100%!important;overflow-x:auto;font-family:monospace;font-size:11px;}
+pre{background:#f4f4f4;border:1px solid #ddd;padding:6px;margin:6px 0;
+  -webkit-border-radius:3px;border-radius:3px;}
+code{background:#f0f0f0;padding:1px 3px;-webkit-border-radius:2px;border-radius:2px;}
+pre code{background:none;padding:0;border-radius:0;}
+
+/* ── Forms ─────────────────────────────────────────────────── */
+input,select,textarea,button{max-width:100%!important;font-size:13px;
+  -webkit-box-sizing:border-box;box-sizing:border-box;}
+input[type=text],input[type=search],input[type=email],input[type=url],
+input[type=password],input[type=number],textarea,select{
+  display:inline-block;padding:5px 6px;border:1px solid #aaa;
+  -webkit-border-radius:3px;border-radius:3px;background:#fff;
+  width:auto;max-width:100%;vertical-align:middle;}
+input[type=submit],input[type=button],input[type=reset],button{
+  display:inline-block;padding:5px 12px;cursor:pointer;
+  background:#e8e8e8;border:1px solid #aaa;
+  -webkit-border-radius:3px;border-radius:3px;
+  color:#222;font-size:13px;text-align:center;}
+input[type=submit]:active,button:active{background:#d0d0d0;}
+label{display:inline-block;margin-bottom:2px;}
+fieldset{border:1px solid #bbb;padding:6px;margin:6px 0;
+  -webkit-border-radius:3px;border-radius:3px;}
+legend{font-weight:bold;padding:0 4px;}
+
+/* ── Lists ─────────────────────────────────────────────────── */
+ul,ol{padding-left:22px;margin:6px 0;}
+li{margin:2px 0;}
+dl{margin:6px 0;}
+dt{font-weight:bold;}
+dd{margin-left:16px;margin-bottom:3px;}
+
+/* ── Blockquote & HR ───────────────────────────────────────── */
+blockquote{margin:8px 4px;padding:4px 10px;border-left:3px solid #aaa;
+  color:#444;background:#f8f8f8;}
+hr{border:0;border-top:1px solid #ccc;margin:10px 0;}
+
+/* ── Position fixes ────────────────────────────────────────── */
 [style*="position:fixed"],[style*="position: fixed"]{position:absolute!important;}
-/* Fluid video container */
-.proxy-video-wrap{position:relative;width:100%;padding-bottom:56.25%;height:0;overflow:hidden;background:#000;margin:4px 0;}
-.proxy-video-wrap video,.proxy-video-wrap iframe{position:absolute;top:0;left:0;width:100%!important;height:100%!important;border:0;}
-/* Narrow-screen tweaks for 3DS (320px top screen) */
-@media screen and (max-width:340px){body{font-size:11px!important;}a{word-break:break-all;}}
+
+/* ── Grid recovery — children of broken grid containers ───── */
+/* When grid-template-columns is stripped, children collapse.
+   Float-based column restoration: elements with data-cols attr
+   set by the proxy, or inline-block for nav/menu children.    */
+nav ul,nav ol{padding:0;margin:0;list-style:none;}
+nav li{display:inline-block;margin:0 4px 4px 0;}
+nav li a{padding:3px 8px;text-decoration:none;background:#eee;
+  display:inline-block;-webkit-border-radius:3px;border-radius:3px;}
+
+/* Common flex/grid container patterns — make them wrap nicely */
+[class*="flex"],[class*="grid"],[class*="row"],[class*="columns"]{
+  overflow:hidden;}
+[class*="flex"] > *,[class*="grid"] > *,[class*="row"] > *{
+  max-width:100%;word-wrap:break-word;}
+
+/* Cards and panels */
+[class*="card"],[class*="panel"],[class*="tile"],[class*="box"]{
+  border:1px solid #ddd;padding:8px;margin:6px 0;background:#fff;
+  -webkit-border-radius:4px;border-radius:4px;display:block;
+  -webkit-box-shadow:0 1px 3px rgba(0,0,0,0.1);box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+
+/* Buttons with class names */
+[class*="btn"],[class*="button"]{
+  display:inline-block!important;padding:5px 12px!important;
+  border:1px solid #aaa!important;-webkit-border-radius:3px!important;
+  border-radius:3px!important;background:#e8e8e8!important;
+  color:#222!important;text-decoration:none!important;
+  font-size:13px!important;cursor:pointer!important;}
+
+/* Badges, tags, pills */
+[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"]{
+  display:inline-block;padding:2px 7px;-webkit-border-radius:10px;
+  border-radius:10px;background:#ddd;color:#333;font-size:11px;
+  border:1px solid #bbb;margin:1px;}
+
+/* Common hero / banner containers */
+[class*="hero"],[class*="banner"],[class*="jumbotron"]{
+  padding:12px 8px!important;margin:0 0 8px!important;}
+
+/* Avoid invisible text on white backgrounds — reset dark mode vars */
+[class*="dark"],[class*="theme"]{color:#222!important;background:#fff!important;}
+
+/* ── Fluid video container ─────────────────────────────────── */
+.proxy-video-wrap{position:relative;width:100%;padding-bottom:56.25%;height:0;
+  overflow:hidden;background:#111;margin:6px 0;
+  -webkit-border-radius:3px;border-radius:3px;}
+.proxy-video-wrap video,.proxy-video-wrap iframe{
+  position:absolute;top:0;left:0;width:100%!important;height:100%!important;border:0;}
+
+/* ── Narrow-screen tweaks for 3DS (320px top screen) ──────── */
+@media screen and (max-width:340px){
+  body{font-size:12px!important;padding:3px!important;}
+  h1{font-size:16px;}h2{font-size:14px;}h3,h4,h5,h6{font-size:12px;}
+  td,th{font-size:11px;padding:2px 3px;}
+  input,select,textarea,button{font-size:12px;}
+  pre,code{font-size:10px;}
+  [class*="btn"],[class*="button"]{padding:4px 8px!important;font-size:12px!important;}
+}
 </style>`);
 
   return $.html();
