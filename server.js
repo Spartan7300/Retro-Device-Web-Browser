@@ -1045,7 +1045,6 @@ function transformHTML(html, targetUrl, proxyBase) {
   const srcAttrs = [
     ['img', 'src'],
     ['img', 'srcset'],
-    ['source', 'src'], ['source', 'srcset'],
     ['input[type="image"]', 'src'],
     ['link[rel="icon"]', 'href'], ['link[rel="shortcut icon"]', 'href'],
     ['link[rel="apple-touch-icon"]', 'href'],
@@ -1575,18 +1574,16 @@ app.get('/video', async (req, res) => {
       return res.redirect(streamUrl);
     }
 
-    // ── Direct video URL — pass-through or low-quality transcode ──
+    // ── Direct video URL ───────────────────────────────────────
+    // Strategy: redirect directly to the video URL (302).
+    // The 3DS <video> element follows redirects natively, and this avoids
+    // Render's streaming timeouts entirely — no bytes need to flow through
+    // the proxy server for the video itself.
+    // If quality=low and ffmpeg is available, transcode instead.
     if (directUrl) {
-      // ── Low-quality transcode via ffmpeg ──────────────────────
       if (wantLow && ffmpegAvailable) {
         res.setHeader('Content-Type', 'video/mp4');
         res.setHeader('Cache-Control', 'no-cache');
-        // Stream the source URL into ffmpeg and pipe the output directly to the response.
-        // -vf scale=426:240   → 240p (16:9); for non-16:9 use scale=426:-2
-        // -b:v 200k           → ~200 kbps video — manageable on 3DS WiFi
-        // -b:a 48k            → low audio bitrate
-        // -preset ultrafast   → minimal encode delay for streaming
-        // -movflags frag_keyframe+empty_moov → fragmented MP4, streamable without seeking
         const ff = spawn('ffmpeg', [
           '-user_agent', MODERN_UA,
           '-i', directUrl,
@@ -1607,10 +1604,7 @@ app.get('/video', async (req, res) => {
           '-f', 'mp4',
           'pipe:1'
         ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
         ff.stdout.pipe(res);
-
-        // Clean up if client disconnects
         res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
         ff.on('error', err => {
           console.error('[video/ffmpeg] spawn error:', err.message);
@@ -1619,35 +1613,8 @@ app.get('/video', async (req, res) => {
         return;
       }
 
-      // ── True pass-through (original quality) ──────────────────
-      // Forward Range header so the 3DS can seek and buffer correctly.
-      const range = req.headers['range'];
-      const upHeaders = { 'User-Agent': MODERN_UA };
-      if (range) upHeaders['Range'] = range;
-
-      const upstream = await axios.get(directUrl, {
-        responseType: 'stream',
-        headers: upHeaders,
-        timeout: 20000,
-        validateStatus: () => true,
-        maxRedirects: 5
-      });
-
-      // Pass every relevant header through untouched
-      const ct = upstream.headers['content-type'] || 'video/mp4';
-      res.setHeader('Content-Type', ct);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
-      if (upstream.headers['content-range'])  res.setHeader('Content-Range',  upstream.headers['content-range']);
-      if (upstream.headers['etag'])           res.setHeader('ETag',           upstream.headers['etag']);
-      if (upstream.headers['last-modified'])  res.setHeader('Last-Modified',  upstream.headers['last-modified']);
-      res.status(upstream.status === 206 ? 206 : 200);
-      upstream.data.pipe(res);
-
-      // Clean up upstream if client disconnects mid-stream
-      res.on('close', () => { try { upstream.data.destroy(); } catch {} });
-      return;
+      // Redirect directly to the video — zero Render overhead.
+      return res.redirect(302, directUrl);
     }
 
     res.status(400).send('<html><body><p>No video source specified.</p><a href="/">Back</a></body></html>');
