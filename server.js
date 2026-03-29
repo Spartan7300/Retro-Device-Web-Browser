@@ -1682,69 +1682,37 @@ function transformHTML(html, targetUrl, proxyBase) {
     }
   });
 
-  // ── <video> elements ──────────────────────────────────────────────────────
+  // ── <video> elements — pass through, let the 3DS handle what it can ─────────
   safeEach($, 'video', function() {
     const videoEl = $(this);
-    let src = videoEl.attr('src') || '';
 
-    // Check for YouTube/etc in src attribute
-    if (src) {
-      const ytId = extractYouTubeId(src);
-      if (ytId) {
-        videoEl.replaceWith(buildVideoBlock(proxyBase, { ytId }));
-        return;
-      }
+    // Proxy src attribute directly — no transcoding, just URL rewrite
+    const src = videoEl.attr('src') || '';
+    if (src && !src.startsWith('data:')) {
+      videoEl.attr('src', proxyBase + '/video?url=' + encodeURIComponent(resolveUrl(targetUrl, src)));
     }
 
-    // Gather sources from <source> children
-    const sources = [];
-    videoEl.find('source').each(function() {
-      const s = $(this).attr('src') || '';
-      const t = $(this).attr('type') || '';
-      if (s && !s.startsWith('data:')) sources.push({ src: s, type: t });
-    });
-
-    // Pick best source: prefer MP4 over WebM/OGV
-    let bestSrc = src;
-    if (!bestSrc && sources.length) {
-      bestSrc = (sources.find(s => /mp4|h264|avc/i.test(s.type + s.src)) || sources[0]).src;
-    }
-
+    // Proxy poster
     const poster = videoEl.attr('poster') || '';
-
-    if (bestSrc && !bestSrc.startsWith('data:')) {
-      const abs = resolveUrl(targetUrl, bestSrc);
-      const proxiedPoster = poster && !poster.startsWith('data:')
-        ? proxyBase + '/resource?url=' + encodeURIComponent(resolveUrl(targetUrl, poster))
-        : '';
-      // Detect HLS/DASH
-      if (/\.m3u8(\?|$)/i.test(abs) || /\.mpd(\?|$)/i.test(abs)) {
-        // HLS/DASH — can't play natively on 3DS; offer a download link
-        videoEl.replaceWith(
-          '<div class="proxy-video-wrap">' +
-          (proxiedPoster ? '<img src="' + proxiedPoster + '" style="max-width:100%;height:auto;">' : '') +
-          '<p style="color:#fff;padding:8px;font-size:12px;">Streaming video (HLS/DASH)<br>' +
-          '<a style="color:#8cf;" href="' + proxyBase + '/video?url=' + encodeURIComponent(abs) + '">Try to play</a></p></div>'
-        );
-        return;
-      }
-      // Regular video
-      const proxiedSrc  = proxyBase + '/video?url=' + encodeURIComponent(abs);
-      const posterAttr  = proxiedPoster ? ' poster="' + proxiedPoster + '"' : '';
-      videoEl.replaceWith(
-        '<div class="proxy-video-wrap">' +
-        '<video controls preload="none"' + posterAttr + ' width="100%">' +
-        '<source src="' + proxiedSrc + '" type="video/mp4">' +
-        '<p style="color:#fff;padding:8px;font-size:12px;">' +
-        '<a style="color:#8cf;" href="' + proxiedSrc + '">Download video</a></p></video></div>'
-      );
-    } else if (!bestSrc) {
-      // No src found at all
-      videoEl.replaceWith('<div class="proxy-video-wrap"><p style="color:#aaa;padding:8px;">[Video unavailable]</p></div>');
-    } else {
-      // data: URI video — remove (3DS can't handle large data URIs)
-      videoEl.replaceWith('<p style="font-size:11px;color:#666;">[Inline video removed]</p>');
+    if (poster && !poster.startsWith('data:')) {
+      videoEl.attr('poster', proxyBase + '/resource?url=' + encodeURIComponent(resolveUrl(targetUrl, poster)));
     }
+
+    // Ensure controls and no preload
+    videoEl.attr('controls', '');
+    videoEl.attr('preload', 'none');
+
+    // Wrap in fluid container if not already
+    if (!videoEl.parent().hasClass('proxy-video-wrap')) {
+      videoEl.wrap('<div class="proxy-video-wrap"></div>');
+    }
+  });
+
+  // ── <source> inside <video> — proxy through /video ────────────────────────
+  safeEach($, 'video source[src]', function() {
+    const src = $(this).attr('src') || '';
+    if (!src || src.startsWith('data:') || src.startsWith(proxyBase)) return;
+    $(this).attr('src', proxyBase + '/video?url=' + encodeURIComponent(resolveUrl(targetUrl, src)));
   });
 
   // ── <audio> elements ──────────────────────────────────────────────────────
@@ -1899,193 +1867,171 @@ function transformHTML(html, targetUrl, proxyBase) {
   // ─────────────────────────────────────────────────────────────────────────
   // ── RECOVERY STYLESHEET — injected LAST so it wins specificity wars ───────
   // ─────────────────────────────────────────────────────────────────────────
+  // Design philosophy:
+  //   • Fix things that are PROVABLY broken on 3DS WebKit (overflow, fixed pos)
+  //   • DO NOT use wildcard class selectors like [class*="col-"] — they hit
+  //     real site classes (Wikipedia's .column-count, DDG's .result-link, etc.)
+  //   • Tables: NEVER force table-layout:fixed — it breaks Wikipedia infoboxes
+  //   • Floats: NEVER kill floats globally — Wikipedia relies on float:right
+  //   • Keep specificity LOW so site styles can still win where they should
   $('body').append(`<style>
-/* ── 3DS Proxy Recovery Stylesheet v2 ─────────────────────────────────── */
+/* ── 3DS Proxy Recovery Stylesheet v3 ─────────────────────────────────── */
 
-/* Box model reset */
+/* Box model — apply universally, low specificity */
 *{-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;}
-html,body{width:100%!important;max-width:100%!important;overflow-x:hidden!important;
-  margin:0!important;padding:0!important;word-wrap:break-word;word-break:break-word;}
-body{padding:6px!important;line-height:1.5;background:#fff;color:#222;}
 
-/* Typography */
-body,input,select,textarea,button{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;}
-h1{font-size:20px;margin:10px 0 6px;}h2{font-size:17px;margin:9px 0 5px;}
-h3{font-size:15px;margin:8px 0 4px;}h4,h5,h6{font-size:13px;margin:6px 0 3px;}
-h1,h2,h3,h4,h5,h6{line-height:1.3;font-weight:bold;}p{margin:6px 0;}
+/* html/body — only fix overflow and width, don't force padding/background */
+html,body{
+  width:100%!important;max-width:100%!important;
+  overflow-x:hidden!important;
+  word-wrap:break-word;
+}
+body{
+  margin:0;padding:4px;
+  line-height:1.5;
+  font-family:Arial,Helvetica,sans-serif;
+  font-size:13px;
+  color:#222;
+  background:#fff;
+}
 
-/* Links */
-a{color:#0055cc;text-decoration:underline;}a:visited{color:#551a8b;}
-a:hover,a:focus{color:#0033aa;}
+/* Typography — sensible defaults, let sites override */
+h1{font-size:20px;margin:10px 0 6px;line-height:1.3;font-weight:bold;}
+h2{font-size:17px;margin:9px 0 5px;line-height:1.3;font-weight:bold;}
+h3{font-size:15px;margin:8px 0 4px;line-height:1.3;font-weight:bold;}
+h4,h5,h6{font-size:13px;margin:6px 0 3px;line-height:1.3;font-weight:bold;}
+p{margin:6px 0;}
+a{color:#0055cc;text-decoration:underline;}
+a:visited{color:#551a8b;}
 
-/* Images & media */
-img,video,canvas,svg{max-width:100%!important;height:auto!important;display:inline-block;}
-img{vertical-align:middle;}figure{margin:6px 0;}figcaption{font-size:11px;color:#555;margin-top:2px;}
+/* Images — constrain but allow floats (Wikipedia uses float:right on images) */
+img{max-width:100%!important;height:auto!important;vertical-align:middle;}
+figure{margin:6px 0;}
+figcaption{font-size:11px;color:#555;margin-top:2px;}
 
-/* Tables */
-table{width:100%!important;max-width:100%!important;border-collapse:collapse;
-  word-wrap:break-word;table-layout:fixed;margin:6px 0;}
-td,th{word-wrap:break-word;overflow:hidden;padding:4px 5px;
-  border:1px solid #ddd;vertical-align:top;text-align:left;}
+/* CRITICAL: do NOT set table-layout:fixed — it breaks Wikipedia infoboxes.
+   DO constrain table width and let it scroll if needed. */
+table{
+  max-width:100%!important;
+  border-collapse:collapse;
+  word-wrap:break-word;
+  margin:4px 0;
+}
+/* Only add borders if the table has no border attribute set — avoids
+   double-bordering sites that set their own. Use low-specificity rule. */
+table:not([border]) td,table:not([border]) th{
+  border:1px solid #ddd;
+}
+td,th{
+  word-wrap:break-word;
+  overflow:hidden;
+  padding:3px 4px;
+  vertical-align:top;
+  text-align:left;
+}
 th{background:#f0f0f0;font-weight:bold;}
-tr:nth-child(even) td{background:#f9f9f9;}
-/* Wide tables — allow horizontal scroll */
-.proxy-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;}
 
 /* Code */
-pre,code,kbd,samp{white-space:pre-wrap!important;word-wrap:break-word!important;
-  max-width:100%!important;font-family:monospace;font-size:11px;}
-pre{background:#f4f4f4;border:1px solid #ddd;padding:6px;margin:6px 0;
-  -webkit-border-radius:3px;border-radius:3px;overflow-x:auto;}
+pre,code,kbd,samp{
+  white-space:pre-wrap!important;
+  word-wrap:break-word!important;
+  max-width:100%!important;
+  font-family:monospace;
+  font-size:11px;
+}
+pre{
+  background:#f4f4f4;border:1px solid #ddd;padding:6px;margin:6px 0;
+  -webkit-border-radius:3px;border-radius:3px;overflow-x:auto;
+}
 code{background:#f0f0f0;padding:1px 3px;-webkit-border-radius:2px;border-radius:2px;}
 pre code{background:none;padding:0;}
 
-/* Forms */
-input,select,textarea,button{max-width:100%!important;font-size:13px;
-  -webkit-box-sizing:border-box;box-sizing:border-box;}
+/* Forms — constrain but don't override site styling */
+input,select,textarea,button{
+  max-width:100%!important;
+  -webkit-box-sizing:border-box;box-sizing:border-box;
+}
 input[type=text],input[type=search],input[type=email],input[type=url],
 input[type=password],input[type=number],input[type=tel],input[type=date],
 textarea,select{
-  display:inline-block;padding:5px 6px;border:1px solid #aaa;
-  -webkit-border-radius:3px;border-radius:3px;background:#fff;
-  width:auto;max-width:100%;vertical-align:middle;}
-input[type=submit],input[type=button],input[type=reset],button,[type=submit]{
-  display:inline-block;padding:5px 12px;cursor:pointer;
+  padding:4px 5px;border:1px solid #aaa;
+  -webkit-border-radius:3px;border-radius:3px;
+  background:#fff;max-width:100%;
+}
+input[type=submit],input[type=button],input[type=reset],button{
+  padding:4px 10px;cursor:pointer;
   background:#e8e8e8;border:1px solid #aaa;
   -webkit-border-radius:3px;border-radius:3px;
-  color:#222;font-size:13px;text-align:center;}
-input[type=submit]:active,button:active{background:#d0d0d0;}
+  font-size:13px;
+}
+input[type=checkbox],input[type=radio]{width:auto;}
 label{display:inline-block;margin-bottom:2px;}
-fieldset{border:1px solid #bbb;padding:6px;margin:6px 0;
-  -webkit-border-radius:3px;border-radius:3px;}
-legend{font-weight:bold;padding:0 4px;}
-input[type=checkbox],input[type=radio]{width:auto;margin-right:4px;}
-input[type=range]{width:100%;}
 
 /* Lists */
-ul,ol{padding-left:22px;margin:6px 0;}li{margin:2px 0;}
-dl{margin:6px 0;}dt{font-weight:bold;}dd{margin-left:16px;margin-bottom:3px;}
+ul,ol{padding-left:22px;margin:4px 0;}
+li{margin:2px 0;}
+dl{margin:4px 0;}
+dt{font-weight:bold;}
+dd{margin-left:16px;margin-bottom:3px;}
 
 /* Blockquote & HR */
-blockquote{margin:8px 4px;padding:4px 10px;border-left:3px solid #aaa;color:#444;background:#f8f8f8;}
-hr{border:0;border-top:1px solid #ccc;margin:10px 0;}
+blockquote{
+  margin:8px 4px;padding:4px 10px;
+  border-left:3px solid #aaa;color:#444;background:#f8f8f8;
+}
+hr{border:0;border-top:1px solid #ccc;margin:8px 0;}
 
-/* Position fixes — fixed causes viewport issues on 3DS */
-[style*="position:fixed"],[style*="position: fixed"]{position:absolute!important;}
-/* Sticky headers keep their stickiness */
-[style*="position:sticky"],[style*="position: sticky"]{position:-webkit-sticky!important;position:sticky!important;}
+/* CRITICAL position fixes — position:fixed causes viewport problems on 3DS.
+   We ONLY change fixed→absolute in inline styles (the CSS transform already
+   converts it in stylesheets). We do NOT globally override all fixed elements
+   via class selectors — that would break things like sticky headers. */
+[style*="position:fixed"],[style*="position: fixed"]{
+  position:absolute!important;
+}
 
-/* Nav */
-nav ul,nav ol{padding:0;margin:0;list-style:none;}
-nav li{display:inline-block;margin:0 4px 4px 0;}
-nav li a{padding:3px 8px;text-decoration:none;background:#eee;
-  display:inline-block;-webkit-border-radius:3px;border-radius:3px;}
+/* SVG/canvas — constrain */
+svg,canvas{max-width:100%!important;}
 
-/* Cards and panels */
-[class*="card"],[class*="panel"],[class*="tile"],[class*="box"]{
-  border:1px solid #ddd;padding:8px;margin:6px 0;background:#fff;
-  -webkit-border-radius:4px;border-radius:4px;display:block;
-  -webkit-box-shadow:0 1px 3px rgba(0,0,0,0.1);box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+/* Iframe */
+iframe{max-width:100%!important;border:1px solid #ccc;}
 
-/* Buttons with class names */
-[class*="btn"],[class*="button"]{
-  display:inline-block!important;padding:5px 12px!important;
-  border:1px solid #aaa!important;-webkit-border-radius:3px!important;
-  border-radius:3px!important;background:#e8e8e8!important;
-  color:#222!important;text-decoration:none!important;
-  font-size:13px!important;cursor:pointer!important;}
-
-/* Badges, tags */
-[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"]{
-  display:inline-block;padding:2px 7px;-webkit-border-radius:10px;
-  border-radius:10px;background:#ddd;color:#333;font-size:11px;
-  border:1px solid #bbb;margin:1px;}
-
-/* Hero / banner */
-[class*="hero"],[class*="banner"],[class*="jumbotron"]{
-  padding:12px 8px!important;margin:0 0 8px!important;}
-
-/* Dark mode reset — only root-level dark wrappers, not every element with 'dark' in its class */
-body.dark,body[class*="dark-theme"],body[class*="theme-dark"],
-#app.dark,#root.dark,html.dark{color:#222!important;background:#f5f5f5!important;}
-
-/* Grid/flex container recovery */
-[class*="flex"],[class*="grid"],[class*="row"],[class*="columns"]{overflow:hidden;}
-[class*="flex"] > *,[class*="grid"] > *,[class*="row"] > *{max-width:100%;word-wrap:break-word;}
-
-/* Collapse multi-column to single */
-[class*="col-"],[class*="column"]{width:100%!important;max-width:100%!important;
-  float:none!important;display:block!important;}
-
-/* Modals and overlays — make them scrollable not fixed */
-[class*="modal"],[class*="overlay"],[class*="dialog"],[class*="popup"]{
-  position:relative!important;top:auto!important;left:auto!important;
-  width:100%!important;max-width:100%!important;
-  height:auto!important;max-height:none!important;
-  -webkit-transform:none!important;transform:none!important;
-  margin:10px auto!important;
-  border:2px solid #aaa;-webkit-border-radius:4px;border-radius:4px;
-  background:#fff;padding:10px;overflow:visible!important;}
-
-/* Sidebars become top-of-page blocks */
-[class*="sidebar"],[class*="aside"],[class*="widget-area"]{
-  width:100%!important;max-width:100%!important;float:none!important;
-  display:block!important;margin:0 0 8px!important;}
-
-/* Sticky bars */
-[class*="sticky"],[class*="fixed-top"],[class*="navbar-fixed"]{
-  position:relative!important;}
-
-/* Tooltips / popovers → hide */
-[class*="tooltip"],[class*="popover"],[role="tooltip"]{display:none!important;}
-
-/* Fluid video container (the crown jewel) */
+/* Video wrapper */
 .proxy-video-wrap{
   position:relative;width:100%;padding-bottom:56.25%;height:0;
   overflow:hidden;background:#111;margin:6px 0;
-  -webkit-border-radius:3px;border-radius:3px;}
+  -webkit-border-radius:3px;border-radius:3px;
+}
 .proxy-video-wrap video,.proxy-video-wrap iframe{
-  position:absolute;top:0;left:0;width:100%!important;height:100%!important;border:0;}
-.proxy-video-wrap p{position:absolute;top:50%;left:0;width:100%;
-  -webkit-transform:translateY(-50%);transform:translateY(-50%);text-align:center;}
-.proxy-video-wrap img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;}
+  position:absolute;top:0;left:0;
+  width:100%!important;height:100%!important;border:0;
+}
+.proxy-video-wrap > p{
+  position:absolute;top:50%;left:0;width:100%;
+  -webkit-transform:translateY(-50%);transform:translateY(-50%);
+  text-align:center;margin:0;
+}
 
-/* Audio player */
+/* Audio */
 .proxy-audio-wrap{margin:6px 0;padding:4px 0;}
 
-/* Spinner/loader elements → hide */
-[class*="spinner"],[class*="loader"],[class*="loading"]{
-  display:none!important;}
+/* Details/summary polyfill support */
+details{border:1px solid #ccc;padding:4px 8px;margin:4px 0;
+  -webkit-border-radius:3px;border-radius:3px;}
+summary{cursor:pointer;font-weight:bold;padding:2px 0;}
 
-/* Progress bars — make them visible */
-progress,[class*="progress"]{
-  width:100%!important;height:16px;display:block;margin:4px 0;
-  background:#ddd;border:1px solid #bbb;-webkit-border-radius:8px;border-radius:8px;overflow:hidden;}
-
-/* Details/summary */
-details{border:1px solid #ccc;padding:4px 8px;margin:4px 0;-webkit-border-radius:3px;border-radius:3px;}
-summary{cursor:pointer;font-weight:bold;padding:4px 0;}
-
-/* Iframe generic */
-iframe{max-width:100%!important;border:1px solid #ccc;}
-
-/* Skip-to-content links */
-[class*="skip-link"],[class*="screen-reader"]{position:absolute;left:-9999px;}
-
-/* Selection highlight */
+/* Selection */
 ::-webkit-selection{background:#b3d4fd;color:#000;}
-::-moz-selection{background:#b3d4fd;color:#000;}
 
-/* Narrow-screen tweaks for 3DS top screen (320px) */
+/* 3DS narrow screen (top screen ~320px wide) */
 @media screen and (max-width:340px){
-  body{font-size:12px!important;padding:3px!important;}
-  h1{font-size:16px;}h2{font-size:14px;}h3,h4,h5,h6{font-size:12px;}
+  body{font-size:12px!important;padding:2px!important;}
+  h1{font-size:16px;}
+  h2{font-size:14px;}
+  h3,h4,h5,h6{font-size:12px;}
   td,th{font-size:11px;padding:2px 3px;}
   input,select,textarea,button{font-size:12px;}
   pre,code{font-size:10px;}
-  [class*="btn"],[class*="button"]{padding:4px 8px!important;font-size:12px!important;}
-  nav li a{padding:2px 5px;font-size:12px;}
-  .proxy-video-wrap{padding-bottom:75%;} /* taller ratio on small screen */
+  .proxy-video-wrap{padding-bottom:75%;}
 }
 </style>`);
 
@@ -2443,220 +2389,81 @@ async function scrapeEmbedVideoUrl(embedUrl) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// §15  VIDEO ENDPOINT — the most complex route
+// §15  VIDEO ENDPOINT — pure passthrough with Range support
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-//  Handles:
-//   /video?id=<ytId>&src=youtube       — YouTube via ytdl-core
-//   /video?id=<dmId>&src=dailymotion   — Dailymotion API
-//   /video?url=<directUrl>             — Direct video, optionally transcoded
-//   /video?url=<hlsUrl>                — HLS manifest (M3U8) — fetch first segment
+//  No transcoding. No ffmpeg. Whatever the server sends, we pass it to the 3DS.
+//  If the 3DS can play it, great. If not, it just won't play.
 //
-// The 3DS supports H.264 Baseline in an MP4 container at up to 240p.
-// We attempt to serve that, using ffmpeg transcoding when available.
+//  Handles:
+//   /video?url=<directUrl>             — any direct video URL
+//   /video?id=<ytId>&src=youtube       — YouTube via ytdl-core (stream only)
+//   /video?id=<dmId>&src=dailymotion   — Dailymotion (redirect to stream URL)
 
 app.get('/video', async (req, res) => {
   const directUrl = (req.query.url || '').trim();
   const id        = (req.query.id  || '').trim();
   const src       = (req.query.src || '').toLowerCase();
 
-  // ── Error helper ────────────────────────────────────────────────────────
   const videoError = (msg, code) => {
+    if (res.headersSent) return;
     res.status(code || 500).setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send('<html><body><h3>Video error</h3><p>' + msg + '</p><a href="/">Back</a></body></html>');
   };
 
   try {
-    // ────────────────────────────────────────────────────────────────────
-    // YouTube via ytdl-core
-    // ────────────────────────────────────────────────────────────────────
+    // ── YouTube — stream lowest quality combined format directly ──────────────
     if (src === 'youtube' && id) {
-      if (!ytdl) {
-        return videoError('YouTube streaming requires <b>ytdl-core</b>.<br>Run: <code>npm install ytdl-core</code>', 503);
-      }
+      if (!ytdl) return videoError('ytdl-core not installed', 503);
       const videoUrl = 'https://www.youtube.com/watch?v=' + id;
-      const info     = await ytdl.getInfo(videoUrl);
-
-      // Prefer combined H.264 MP4 at ≤240p, fall back to lowest available
+      const info = await ytdl.getInfo(videoUrl);
+      // Pick lowest combined (video+audio) format — simplest for 3DS
       let format = null;
-      const preferOrder = ['144p','240p','360p','480p','small'];
-      for (const ql of preferOrder) {
-        try {
-          format = ytdl.chooseFormat(info.formats, {
-            quality: ql,
-            filter: f => f.hasVideo && f.hasAudio && (f.container === 'mp4') && f.videoCodec && /avc/.test(f.videoCodec)
-          });
-          if (format) break;
-        } catch {}
-      }
-      if (!format) {
-        try { format = ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' }); } catch {}
-      }
-      if (!format) {
-        // Last resort: separate streams (no audio/video merge without ffmpeg)
-        format = info.formats.filter(f => f.hasVideo)[0] || info.formats[0];
-      }
-
-      if (ffmpeg && format) {
-        // Transcode to 3DS-friendly MP4 on the fly
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        const ytStream = ytdl(videoUrl, { format });
-        const cmd = ffmpeg(ytStream)
-          .videoCodec('libx264')
-          .addOption('-profile:v', 'baseline')
-          .addOption('-level', '3.0')
-          .addOption('-vf', 'scale=-2:' + VIDEO_MAX_HEIGHT)
-          .videoBitrate('300k')
-          .audioCodec('aac')
-          .audioBitrate('64k')
-          .audioChannels(1)
-          .audioFrequency(22050)
-          .format('mp4')
-          .addOption('-movflags', 'frag_keyframe+empty_moov+faststart')
-          .on('error', err => { console.warn('[video/yt] ffmpeg error:', err.message); try { res.end(); } catch {} });
-        cmd.pipe(res);
-      } else if (format) {
-        // Stream directly
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        ytdl(videoUrl, { format }).pipe(res);
-      } else {
-        return videoError('No compatible YouTube format found.');
-      }
+      try { format = ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' }); } catch {}
+      if (!format) format = info.formats[0];
+      if (!format) return videoError('No YouTube format found');
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      ytdl(videoUrl, { format }).pipe(res);
       return;
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Dailymotion — fetch metadata, redirect to lowest quality stream
-    // ────────────────────────────────────────────────────────────────────
+    // ── Dailymotion — redirect to lowest quality stream URL ───────────────────
     if (src === 'dailymotion' && id) {
       const apiUrl = 'https://www.dailymotion.com/player/metadata/video/' + id;
-      let streamUrl = null;
       try {
         const meta = await axios.get(apiUrl, { headers: { 'User-Agent': MODERN_UA }, timeout: 10000, validateStatus: () => true });
         if (meta.data && meta.data.qualities) {
           for (const p of ['144','240','380','480','auto']) {
             const bucket = meta.data.qualities[p];
-            if (bucket && bucket[0] && bucket[0].url) { streamUrl = bucket[0].url; break; }
+            if (bucket && bucket[0] && bucket[0].url) return res.redirect(bucket[0].url);
           }
         }
-      } catch(e) { console.warn('[video/dm] metadata fetch failed:', e.message); }
-
-      if (!streamUrl) return videoError('Dailymotion stream not found.', 404);
-
-      if (ffmpeg) {
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        const cmd = ffmpeg(streamUrl)
-          .videoCodec('libx264')
-          .addOption('-profile:v', 'baseline')
-          .addOption('-level', '3.0')
-          .addOption('-vf', 'scale=-2:' + VIDEO_MAX_HEIGHT)
-          .videoBitrate('300k')
-          .audioCodec('aac')
-          .audioBitrate('64k')
-          .audioChannels(1)
-          .format('mp4')
-          .addOption('-movflags', 'frag_keyframe+empty_moov')
-          .on('error', err => { console.warn('[video/dm] ffmpeg error:', err.message); try { res.end(); } catch {} });
-        cmd.pipe(res);
-      } else {
-        return res.redirect(streamUrl);
-      }
-      return;
+      } catch(e) { console.warn('[video/dm]', e.message); }
+      return videoError('Dailymotion stream not found', 404);
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Direct video URL
-    // ────────────────────────────────────────────────────────────────────
+    // ── Direct URL — pure passthrough with Range support ─────────────────────
     if (directUrl) {
-      const range   = req.headers['range'];
+      const range = req.headers['range'];
       const headers = { 'User-Agent': MODERN_UA, 'Accept': 'video/*, */*' };
       if (range) headers['Range'] = range;
 
-      // ── HLS / DASH manifest ─────────────────────────────────────────
-      if (/\.m3u8(\?|$)/i.test(directUrl) || /\.mpd(\?|$)/i.test(directUrl)) {
-        if (ffmpeg) {
-          // Transcode HLS/DASH to fragmented MP4 stream
-          res.setHeader('Content-Type', 'video/mp4');
-          res.setHeader('Cache-Control', 'no-cache');
-          const cmd = ffmpeg(directUrl)
-            .inputOptions(['-allowed_extensions', 'ALL', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'])
-            .videoCodec('libx264')
-            .addOption('-profile:v', 'baseline')
-            .addOption('-level', '3.0')
-            .addOption('-vf', 'scale=-2:' + VIDEO_MAX_HEIGHT)
-            .videoBitrate('300k')
-            .audioCodec('aac')
-            .audioBitrate('64k')
-            .audioChannels(1)
-            .format('mp4')
-            .addOption('-movflags', 'frag_keyframe+empty_moov+faststart')
-            .on('error', err => { console.warn('[video/hls] ffmpeg error:', err.message); try { res.end(); } catch {} });
-          cmd.pipe(res);
-          return;
-        }
-        // No ffmpeg — try fetching the master playlist and redirecting to first segment
-        try {
-          const m3u8 = await axios.get(directUrl, { headers: { 'User-Agent': MODERN_UA }, timeout: 8000 });
-          const lines = m3u8.data.toString().split('\n');
-          // Find first media URI (non-comment, non-empty)
-          const segment = lines.find(l => l.trim() && !l.startsWith('#'));
-          if (segment) {
-            const segUrl = resolveUrl(directUrl, segment.trim());
-            return res.redirect('/video?url=' + encodeURIComponent(segUrl));
-          }
-        } catch {}
-        return videoError('HLS streaming requires ffmpeg. Install fluent-ffmpeg + ffmpeg-static.', 503);
-      }
-
-      // ── Decide whether to transcode ─────────────────────────────────
-      const needsTranscode = ffmpeg && (
-        /\.webm(\?|$)/i.test(directUrl) ||
-        /video\/webm/.test(req.query.ct || '') ||
-        /\.ogv(\?|$)/i.test(directUrl) ||
-        /\.avi(\?|$)/i.test(directUrl) ||
-        /\.mkv(\?|$)/i.test(directUrl) ||
-        /\.flv(\?|$)/i.test(directUrl) ||
-        /\.mov(\?|$)/i.test(directUrl)
-      );
-
-      if (needsTranscode) {
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        const cmd = ffmpeg(directUrl)
-          .videoCodec('libx264')
-          .addOption('-profile:v', 'baseline')
-          .addOption('-level', '3.0')
-          .addOption('-vf', 'scale=-2:' + VIDEO_MAX_HEIGHT)
-          .videoBitrate('300k')
-          .audioCodec('aac')
-          .audioBitrate('64k')
-          .audioChannels(1)
-          .format('mp4')
-          .addOption('-movflags', 'frag_keyframe+empty_moov')
-          .on('error', err => { console.warn('[video] ffmpeg error:', err.message); try { res.end(); } catch {} });
-        cmd.pipe(res);
-        return;
-      }
-
-      // ── Passthrough with Range support ──────────────────────────────
       const upstream = await axios.get(directUrl, {
         responseType: 'stream',
         headers,
-        timeout: VIDEO_TIMEOUT_MS,
+        timeout: 60000,
         validateStatus: () => true,
         maxRedirects: 5,
         maxContentLength: Infinity
       });
 
       const ct = upstream.headers['content-type'] || 'video/mp4';
-      res.setHeader('Content-Type', ct.includes('video') ? ct : 'video/mp4');
+      res.setHeader('Content-Type', ct);
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'public, max-age=3600');
-      if (upstream.headers['content-length']) res.setHeader('Content-Length',  upstream.headers['content-length']);
-      if (upstream.headers['content-range'])  res.setHeader('Content-Range',   upstream.headers['content-range']);
+      if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+      if (upstream.headers['content-range'])  res.setHeader('Content-Range',  upstream.headers['content-range']);
       res.status(upstream.status === 206 ? 206 : 200);
       upstream.data.pipe(res);
       return;
