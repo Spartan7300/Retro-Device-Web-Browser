@@ -432,19 +432,10 @@ function downgradeCSSProperty(decl, vars) {
     ];
   }
 
-  // ── gap → margin approximation ────────────────────────────────────────────
-  if (prop === 'gap' || prop === 'grid-gap') {
-    const gparts = val.trim().split(/\s+/);
-    const gRow = gparts[0], gCol = gparts[1] || gparts[0];
-    return [
-      { type:'declaration', property:'margin-bottom', value: gRow },
-      { type:'declaration', property:'margin-right',  value: gCol }
-    ];
-  }
-  if (prop === 'column-gap' || prop === 'grid-column-gap')
-    return [{ type:'declaration', property:'margin-right', value: val }];
-  if (prop === 'row-gap' || prop === 'grid-row-gap')
-    return [{ type:'declaration', property:'margin-bottom', value: val }];
+  // ── gap — drop entirely (only meaningful in flex/grid, which 3DS doesn't support) ──
+  if (prop === 'gap' || prop === 'grid-gap' ||
+      prop === 'column-gap' || prop === 'grid-column-gap' ||
+      prop === 'row-gap'    || prop === 'grid-row-gap') return [];
 
   // ── CSS Grid — convert to block layout ───────────────────────────────────
   if (prop === 'grid-template-columns') {
@@ -901,12 +892,6 @@ function transformJS(src, proxyBase) {
       // ── Default params: function(x=1) → strip defaults ────────────────────
       .replace(/function\s*(\w*)\s*\(([^)]*)\)/g, (m, name, args) =>
         'function ' + name + '(' + args.replace(/=\s*[^,)]+/g, '') + ')')
-
-      // ── Shorthand method: { foo() {} } → { foo: function() {} } ──────────
-      .replace(/(\w+)\s*\(([^)]*)\)\s*\{/g, (m, name, args) => {
-        if (/^(if|for|while|switch|catch|function)$/.test(name)) return m;
-        return name + ': function(' + args + '){';
-      })
 
       // ── Proxy location navigations through proxy ──────────────────────────
       .replace(/((?:window\.)?location\.href\s*=\s*)(['"])(https?:\/\/[^'"]+)(['"])/g,
