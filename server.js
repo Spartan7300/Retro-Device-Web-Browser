@@ -1618,6 +1618,16 @@ function transformHTML(html, targetUrl, proxyBase) {
         '<a style="color:#8cf;" href="' + proxyBase + '/proxy?url=' + encodeURIComponent('https://www.twitch.tv/' + twitch.id) + '">' +
         'Open Twitch page</a></p></div>'
       );
+    } else if (isEmbedHost(abs)) {
+      // Known streaming embed host — server-side scrape for real MP4/m3u8
+      $(this).replaceWith(
+        '<div class="proxy-video-wrap">' +
+        '<video controls preload="none" width="100%">' +
+        '<source src="' + proxyBase + '/embed-video?url=' + encodeURIComponent(abs) + '" type="video/mp4">' +
+        '<p style="color:#fff;padding:8px;font-size:12px;">' +
+        'Loading video... <a style="color:#8cf;" href="' + proxyBase + '/embed-video?url=' + encodeURIComponent(abs) + '">Direct link</a>' +
+        '</p></video></div>'
+      );
     } else if (/facebook\.com\/plugins\/video|fb\.watch/.test(abs)) {
       const fbUrl = abs.match(/href=([^&]+)/);
       const link  = fbUrl ? decodeURIComponent(fbUrl[1]) : abs;
@@ -1974,7 +1984,8 @@ nav li a{padding:3px 8px;text-decoration:none;background:#eee;
 /* Cards and panels */
 [class*="card"],[class*="panel"],[class*="tile"],[class*="box"]{
   border:1px solid #ddd;padding:8px;margin:6px 0;background:#fff;
-  -webkit-border-radius:4px;border-radius:4px;display:block;}
+  -webkit-border-radius:4px;border-radius:4px;display:block;
+  -webkit-box-shadow:0 1px 3px rgba(0,0,0,0.1);box-shadow:0 1px 3px rgba(0,0,0,0.1);}
 
 /* Buttons with class names */
 [class*="btn"],[class*="button"]{
@@ -1994,8 +2005,9 @@ nav li a{padding:3px 8px;text-decoration:none;background:#eee;
 [class*="hero"],[class*="banner"],[class*="jumbotron"]{
   padding:12px 8px!important;margin:0 0 8px!important;}
 
-/* Dark mode reset */
-[class*="dark"],[class*="theme-dark"]{color:#222!important;background:#f5f5f5!important;}
+/* Dark mode reset — only root-level dark wrappers, not every element with 'dark' in its class */
+body.dark,body[class*="dark-theme"],body[class*="theme-dark"],
+#app.dark,#root.dark,html.dark{color:#222!important;background:#f5f5f5!important;}
 
 /* Grid/flex container recovery */
 [class*="flex"],[class*="grid"],[class*="row"],[class*="columns"]{overflow:hidden;}
@@ -2337,6 +2349,100 @@ app.get('/audio', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// §14b  STREAMING EMBED HOST SCRAPER
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Sites like HiMovies embed video via third-party JS-rendered players
+// (Filemoon, Streamtape, Doodstream, Vidsrc, Vidcloud, etc.).
+// The 3DS can't run their JavaScript, so we server-side scrape the actual
+// MP4/m3u8 URL from the embed page HTML and redirect to /video.
+
+const EMBED_HOSTS = [
+  /filemoon\.sx/, /filemoon\.to/, /filemoon\.in/,
+  /streamtape\.com/, /streamtape\.net/, /streamtape\.to/,
+  /doodstream\.com/, /dood\.watch/, /dood\.la/, /dood\.to/,
+  /vidsrc\.to/, /vidsrc\.me/, /vidsrc\.net/, /vidsrc\.xyz/, /vidsrc\.icu/,
+  /vidcloud\.co/, /vidcloud\.lol/, /vidcloud\.one/,
+  /upstream\.to/, /upcloud\.co/,
+  /mixdrop\.co/, /mixdrop\.to/, /mixdrop\.ch/,
+  /streamlare\.com/,
+  /embedsito\.com/,
+  /smashystream\.com/,
+  /2embed\.to/, /2embed\.org/,
+  /multi\.rapidcloud\.live/,
+  /smashy\.stream/,
+  /closeload\.com/,
+  /moviesapi\.club/,
+  /embed\.su/,
+  /autoembed\.cc/, /autoembed\.to/,
+  /embed\.cc/,
+  /ridoo\.net/,
+];
+
+function isEmbedHost(url) {
+  return EMBED_HOSTS.some(re => re.test(url));
+}
+
+async function scrapeEmbedVideoUrl(embedUrl) {
+  // Fetch the embed page and hunt for direct video URLs in the HTML/JS
+  try {
+    const r = await axios.get(embedUrl, {
+      headers: {
+        'User-Agent': MODERN_UA,
+        'Referer': embedUrl,
+        'Accept': 'text/html,application/xhtml+xml,*/*',
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+      responseType: 'arraybuffer',
+      maxRedirects: 5,
+    });
+    const body = r.data.toString('utf-8');
+
+    // Pattern bank — ordered by specificity
+    const patterns = [
+      // Direct .mp4/.m3u8 in src= or file= attributes or JS strings
+      /['"](https?:\/\/[^'"]+\.mp4[^'"]*)['"]/gi,
+      /['"](https?:\/\/[^'"]+\.m3u8[^'"]*)['"]/gi,
+      // Common player config keys
+      /(?:file|src|source|hls|stream|video_url|videoUrl|streamUrl|playUrl)\s*[:=]\s*['"]([^'"]{20,})['"]/gi,
+      // Streamtape specific
+      /document\.getElementById\(['"]\w+['"]\)\.innerHTML\s*=\s*['"](https?[^'"]+)['"]/i,
+      // Doodstream token pattern
+      /\/pass_md5\/[^'"]+['"][^'"]*['"]([^'"]+)['"]/i,
+      // Generic fallback: any https url with video-ish path
+      /['"](https?:\/\/[^\s'"<>]{10,}\/(video|stream|hls|cdn)[^\s'"<>]*)['"]/gi,
+    ];
+
+    const found = new Set();
+    for (const pat of patterns) {
+      let m;
+      pat.lastIndex = 0;
+      while ((m = pat.exec(body)) !== null) {
+        const u = m[1];
+        if (u && u.startsWith('http') && !u.includes('{') && u.length < 500) {
+          found.add(u);
+        }
+      }
+    }
+
+    // Score candidates — prefer MP4, then M3U8
+    const candidates = [...found];
+    const mp4 = candidates.find(u => /\.mp4/i.test(u));
+    if (mp4) return mp4;
+    const m3u8 = candidates.find(u => /\.m3u8/i.test(u));
+    if (m3u8) return m3u8;
+    // Any video-looking URL
+    const any = candidates.find(u => /video|stream|cdn|media/i.test(u));
+    if (any) return any;
+    return null;
+  } catch(e) {
+    console.warn('[embed-scrape] failed for', embedUrl, ':', e.message);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // §15  VIDEO ENDPOINT — the most complex route
 // ═══════════════════════════════════════════════════════════════════════════════
 //
@@ -2561,6 +2667,43 @@ app.get('/video', async (req, res) => {
   } catch(err) {
     console.error('[video] error:', err.message);
     videoError(err.message);
+  }
+});
+
+// ── /embed-video — server-side scrape of streaming embed hosts ────────────────
+// Used when an iframe points to filemoon, streamtape, doodstream, vidsrc, etc.
+// We fetch the embed page, extract the real video URL, and redirect/stream it.
+app.get('/embed-video', async (req, res) => {
+  const embedUrl = (req.query.url || '').trim();
+  if (!embedUrl) return res.status(400).send('<html><body><p>No embed URL.</p></body></html>');
+
+  const proxyBase = req.protocol + '://' + req.get('host');
+
+  try {
+    console.log('[embed-video] scraping:', embedUrl);
+    const videoUrl = await scrapeEmbedVideoUrl(embedUrl);
+
+    if (videoUrl) {
+      console.log('[embed-video] found:', videoUrl);
+      // Redirect through /video for range support + optional transcoding
+      return res.redirect('/video?url=' + encodeURIComponent(videoUrl));
+    }
+
+    // Scrape failed — show a helpful page with a direct open link
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(
+      '<html><head>' +
+      '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+      '</head><body style="font-family:Arial,sans-serif;padding:10px;background:#111;color:#eee;">' +
+      '<h3 style="font-size:14px;">Video player not extractable</h3>' +
+      '<p style="font-size:12px;">The video on this embed page uses JavaScript that cannot run on 3DS.</p>' +
+      '<p><a style="color:#8cf;" href="' + proxyBase + '/proxy?url=' + encodeURIComponent(embedUrl) + '">Try opening embed page directly</a></p>' +
+      '<p><a style="color:#8cf;" href="javascript:history.back()">Go back</a></p>' +
+      '</body></html>'
+    );
+  } catch(err) {
+    res.status(500).send('<html><body><h3>Embed error</h3><p>' + err.message + '</p></body></html>');
   }
 });
 
