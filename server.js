@@ -1046,8 +1046,6 @@ function transformHTML(html, targetUrl, proxyBase) {
     ['img', 'src'],
     ['img', 'srcset'],
     ['source', 'src'], ['source', 'srcset'],
-    ['video', 'src'], ['video', 'poster'],
-    ['audio', 'src'], ['track', 'src'],
     ['input[type="image"]', 'src'],
     ['link[rel="icon"]', 'href'], ['link[rel="shortcut icon"]', 'href'],
     ['link[rel="apple-touch-icon"]', 'href'],
@@ -1087,43 +1085,79 @@ function transformHTML(html, targetUrl, proxyBase) {
 
     if (ytMatch) {
       const vid = ytMatch[1];
-      $(this).replaceWith(`<div class="proxy-video-wrap"><video controls preload="none" poster="${proxyBase}/resource?url=${encodeURIComponent(`https://img.youtube.com/vi/${vid}/mqdefault.jpg`)}"><source src="${proxyBase}/video?id=${encodeURIComponent(vid)}&src=youtube" type="video/mp4"><p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${vid}`)}">Watch on YouTube: ${vid}</a></p></video></div>`);
+      const lowSrc  = `${proxyBase}/video?id=${encodeURIComponent(vid)}&src=youtube&quality=low`;
+      const highSrc = `${proxyBase}/video?id=${encodeURIComponent(vid)}&src=youtube`;
+      $(this).replaceWith(
+        `<div class="proxy-video-wrap">` +
+        `<video controls preload="none" poster="${proxyBase}/resource?url=${encodeURIComponent(`https://img.youtube.com/vi/${vid}/mqdefault.jpg`)}">` +
+        `<source src="${lowSrc}" type="video/mp4" data-quality="low">` +
+        `<source src="${highSrc}" type="video/mp4" data-quality="high">` +
+        `<p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${vid}`)}">Watch on YouTube: ${vid}</a></p>` +
+        `</video></div>`
+      );
     } else if (vmMatch) {
       const vid = vmMatch[1];
       $(this).replaceWith(`<div class="proxy-video-wrap"><p style="color:#fff;padding:8px;font-size:12px;">Vimeo video (${vid})<br><a style="color:#8cf;" href="${proxyBase}/proxy?url=${encodeURIComponent(`https://vimeo.com/${vid}`)}">Open on Vimeo</a></p></div>`);
     } else if (dmMatch) {
       const vid = dmMatch[1];
-      $(this).replaceWith(`<div class="proxy-video-wrap"><video controls preload="none"><source src="${proxyBase}/video?id=${encodeURIComponent(vid)}&src=dailymotion" type="video/mp4"><p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.dailymotion.com/video/${vid}`)}">Watch on Dailymotion: ${vid}</a></p></video></div>`);
+      const lowSrc  = `${proxyBase}/video?id=${encodeURIComponent(vid)}&src=dailymotion&quality=low`;
+      const highSrc = `${proxyBase}/video?id=${encodeURIComponent(vid)}&src=dailymotion`;
+      $(this).replaceWith(
+        `<div class="proxy-video-wrap">` +
+        `<video controls preload="none">` +
+        `<source src="${lowSrc}" type="video/mp4" data-quality="low">` +
+        `<source src="${highSrc}" type="video/mp4" data-quality="high">` +
+        `<p><a href="${proxyBase}/proxy?url=${encodeURIComponent(`https://www.dailymotion.com/video/${vid}`)}">Watch on Dailymotion: ${vid}</a></p>` +
+        `</video></div>`
+      );
     } else {
       $(this).attr('src', proxyUrl(abs, proxyBase));
     }
   });
 
-  // Rewrite <video> sources
+  // Rewrite <video> sources — inject dual <source> tags for low/high quality.
+  // The 3DS browser lists quality options based on the <source> elements present.
+  // First source = low quality (smaller, faster); second = original pass-through.
   safeEach($, 'video', function () {
-    const src = $(this).attr('src');
-    if (src && !src.startsWith('data:')) {
-      const abs = resolveUrl(targetUrl, src);
-      $(this).attr('src', `${proxyBase}/video?url=${encodeURIComponent(abs)}`);
-    }
-    const poster = $(this).attr('poster');
+    const vid = $(this);
+    const poster = vid.attr('poster');
     if (poster && !poster.startsWith('data:')) {
-      $(this).attr('poster', `${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, poster))}`);
+      vid.attr('poster', `${proxyBase}/resource?url=${encodeURIComponent(resolveUrl(targetUrl, poster))}`);
     }
-    // Wrap in fluid container if not already
-    if (!$(this).parent().hasClass('proxy-video-wrap')) {
-      $(this).wrap('<div class="proxy-video-wrap"></div>');
-    }
-    // Add controls attribute
-    $(this).attr('controls', '');
-    $(this).attr('preload', 'none');
-  });
+    vid.attr('controls', '');
+    vid.attr('preload', 'none');
 
-  // Rewrite <source> inside <video>
-  safeEach($, 'video source[src]', function () {
-    const src = $(this).attr('src');
-    if (!src || src.startsWith('data:')) return;
-    $(this).attr('src', `${proxyBase}/video?url=${encodeURIComponent(resolveUrl(targetUrl, src))}`);
+    // Collect all video source URLs from the src attribute and child <source> tags
+    const srcUrls = [];
+    const inlineSrc = vid.attr('src');
+    if (inlineSrc && !inlineSrc.startsWith('data:')) {
+      srcUrls.push(resolveUrl(targetUrl, inlineSrc));
+      vid.removeAttr('src'); // will be replaced by <source> elements below
+    }
+    vid.find('source[src]').each(function () {
+      const s = $(this).attr('src');
+      if (s && !s.startsWith('data:')) srcUrls.push(resolveUrl(targetUrl, s));
+      $(this).remove();
+    });
+
+    if (srcUrls.length === 0) {
+      // No sources found — nothing to do
+    } else {
+      // Use the first URL as the canonical source
+      const canonical = srcUrls[0];
+      const lowSrc  = `${proxyBase}/video?url=${encodeURIComponent(canonical)}&quality=low`;
+      const highSrc = `${proxyBase}/video?url=${encodeURIComponent(canonical)}`;
+      // Prepend: low quality first so 3DS defaults to it; high quality second for the toggle
+      vid.prepend(
+        `<source src="${lowSrc}" type="video/mp4" data-quality="low">` +
+        `<source src="${highSrc}" type="video/mp4" data-quality="high">`
+      );
+    }
+
+    // Wrap in fluid container if not already
+    if (!vid.parent().hasClass('proxy-video-wrap')) {
+      vid.wrap('<div class="proxy-video-wrap"></div>');
+    }
   });
 
   // Replace <object>/<embed> that look like video players
@@ -1471,15 +1505,31 @@ app.get('/js', async (req, res) => {
   } catch { res.send('/* js fetch failed */'); }
 });
 
-// ─── VIDEO PROXY (240p target) ───────────────────────────────────
-// Supports: YouTube (ytdl-core), direct video URLs
-// Usage: /video?url=<direct_video_url>
-//        /video?id=<youtube_id>&src=youtube
-//        /video?id=<dailymotion_id>&src=dailymotion
+// ─── VIDEO PROXY ─────────────────────────────────────────────────
+// True pass-through for direct video URLs with range-request support.
+// Optional low-quality transcode: append &quality=low to any /video URL.
+//   /video?url=<direct_video_url>              — pass-through (original quality)
+//   /video?url=<direct_video_url>&quality=low  — ffmpeg transcode to 240p
+//   /video?id=<youtube_id>&src=youtube         — YouTube via ytdl-core
+//   /video?id=<dailymotion_id>&src=dailymotion — Dailymotion lowest stream
+//
+// Low-quality transcode requires ffmpeg on PATH: apt install ffmpeg
+// If ffmpeg is missing the route falls back to pass-through automatically.
+
+// Detect ffmpeg availability once at startup
+const { execFile, spawn } = require('child_process');
+let ffmpegAvailable = false;
+execFile('ffmpeg', ['-version'], { timeout: 3000 }, err => {
+  ffmpegAvailable = !err;
+  if (ffmpegAvailable) console.log('[proxy] ffmpeg found — low-quality transcode enabled');
+  else                 console.warn('[proxy] ffmpeg not found — low-quality transcode disabled (install with: apt install ffmpeg)');
+});
+
 app.get('/video', async (req, res) => {
   const directUrl = (req.query.url || '').trim();
   const id        = (req.query.id  || '').trim();
   const src       = (req.query.src || '').toLowerCase();
+  const wantLow   = (req.query.quality || '').toLowerCase() === 'low';
 
   try {
     // ── YouTube via ytdl-core ──────────────────────────────────
@@ -1489,15 +1539,16 @@ app.get('/video', async (req, res) => {
         return res.status(503).send(`<html><body><p>YouTube video streaming requires <b>ytdl-core</b>.<br>Run: <code>npm install ytdl-core</code></p><a href="/">Back</a></body></html>`);
       }
       const videoUrl = `https://www.youtube.com/watch?v=${ytId}`;
-      // Choose lowest quality ≤ 240p for bandwidth savings
       const info = await ytdl.getInfo(videoUrl);
-      // Prefer combined (video+audio) formats at or below 240p
-      const format = ytdl.chooseFormat(info.formats, {
-        quality: 'lowest',
-        filter: f =>
-          f.hasVideo && f.hasAudio &&
-          (f.qualityLabel === '240p' || f.qualityLabel === '144p' || f.quality === 'small')
-      }) || ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' });
+      // For low quality pick ≤240p combined, otherwise lowest combined available
+      const format = wantLow
+        ? (ytdl.chooseFormat(info.formats, {
+            quality: 'lowest',
+            filter: f => f.hasVideo && f.hasAudio &&
+              (f.qualityLabel === '240p' || f.qualityLabel === '144p' || f.quality === 'small')
+          }) || ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' }))
+        : ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'audioandvideo' })
+          || ytdl.chooseFormat(info.formats, { quality: 'lowest', filter: 'audioandvideo' });
 
       res.setHeader('Content-Type', 'video/mp4');
       res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -1509,11 +1560,10 @@ app.get('/video', async (req, res) => {
     if (src === 'dailymotion' && id) {
       const apiUrl = `https://www.dailymotion.com/player/metadata/video/${id}`;
       const meta = await axios.get(apiUrl, { headers: { 'User-Agent': MODERN_UA }, timeout: 10000, validateStatus: () => true });
-      const qualities = meta.data && meta.data.qualities && meta.data.qualities.auto;
-      // Try to find 240p or lowest quality stream
       let streamUrl = null;
       if (meta.data && meta.data.qualities) {
-        const prios = ['240', '144', '380', 'auto'];
+        // Low quality: prefer 240/144; high quality: prefer 380/720/auto
+        const prios = wantLow ? ['240', '144', '380', 'auto'] : ['720', '480', '380', '240', 'auto'];
         for (const p of prios) {
           const bucket = meta.data.qualities[p];
           if (bucket && bucket[0] && bucket[0].url) { streamUrl = bucket[0].url; break; }
@@ -1525,35 +1575,87 @@ app.get('/video', async (req, res) => {
       return res.redirect(streamUrl);
     }
 
-    // ── Direct video URL proxy ─────────────────────────────────
+    // ── Direct video URL — pass-through or low-quality transcode ──
     if (directUrl) {
+      // ── Low-quality transcode via ffmpeg ──────────────────────
+      if (wantLow && ffmpegAvailable) {
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Cache-Control', 'no-cache');
+        // Stream the source URL into ffmpeg and pipe the output directly to the response.
+        // -vf scale=426:240   → 240p (16:9); for non-16:9 use scale=426:-2
+        // -b:v 200k           → ~200 kbps video — manageable on 3DS WiFi
+        // -b:a 48k            → low audio bitrate
+        // -preset ultrafast   → minimal encode delay for streaming
+        // -movflags frag_keyframe+empty_moov → fragmented MP4, streamable without seeking
+        const ff = spawn('ffmpeg', [
+          '-user_agent', MODERN_UA,
+          '-i', directUrl,
+          '-vf', 'scale=426:-2',
+          '-c:v', 'libx264',
+          '-profile:v', 'baseline',
+          '-level', '3.0',
+          '-b:v', '200k',
+          '-maxrate', '250k',
+          '-bufsize', '400k',
+          '-c:a', 'aac',
+          '-b:a', '48k',
+          '-ar', '22050',
+          '-ac', '1',
+          '-preset', 'ultrafast',
+          '-tune', 'zerolatency',
+          '-movflags', 'frag_keyframe+empty_moov+faststart',
+          '-f', 'mp4',
+          'pipe:1'
+        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+        ff.stdout.pipe(res);
+
+        // Clean up if client disconnects
+        res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
+        ff.on('error', err => {
+          console.error('[video/ffmpeg] spawn error:', err.message);
+          if (!res.headersSent) res.status(500).send('ffmpeg error');
+        });
+        return;
+      }
+
+      // ── True pass-through (original quality) ──────────────────
+      // Forward Range header so the 3DS can seek and buffer correctly.
       const range = req.headers['range'];
-      const headers = { 'User-Agent': MODERN_UA };
-      if (range) headers['Range'] = range;
+      const upHeaders = { 'User-Agent': MODERN_UA };
+      if (range) upHeaders['Range'] = range;
 
       const upstream = await axios.get(directUrl, {
         responseType: 'stream',
-        headers,
+        headers: upHeaders,
         timeout: 20000,
         validateStatus: () => true,
         maxRedirects: 5
       });
 
+      // Pass every relevant header through untouched
       const ct = upstream.headers['content-type'] || 'video/mp4';
       res.setHeader('Content-Type', ct);
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'public, max-age=3600');
       if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
       if (upstream.headers['content-range'])  res.setHeader('Content-Range',  upstream.headers['content-range']);
+      if (upstream.headers['etag'])           res.setHeader('ETag',           upstream.headers['etag']);
+      if (upstream.headers['last-modified'])  res.setHeader('Last-Modified',  upstream.headers['last-modified']);
       res.status(upstream.status === 206 ? 206 : 200);
       upstream.data.pipe(res);
+
+      // Clean up upstream if client disconnects mid-stream
+      res.on('close', () => { try { upstream.data.destroy(); } catch {} });
       return;
     }
 
     res.status(400).send('<html><body><p>No video source specified.</p><a href="/">Back</a></body></html>');
   } catch (err) {
-    res.status(500).setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(`<html><body><h3>Video error</h3><p>${err.message}</p><a href="/">Back</a></body></html>`);
+    if (!res.headersSent) {
+      res.status(500).setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(`<html><body><h3>Video error</h3><p>${err.message}</p><a href="/">Back</a></body></html>`);
+    }
   }
 });
 
